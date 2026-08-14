@@ -1,0 +1,7 @@
+.local-build/
+*.fpk
+*.fpk.sha256sum
+*.log
+.DS_Store
+__pycache__/
+*.pyc

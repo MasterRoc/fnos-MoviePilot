@@ -1,0 +1,37 @@
+[
+  {
+    "stepTitle": "服务配置",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "后端 API 端口",
+        "rules": [
+          { "pattern": "^[0-9]+$", "message": "请输入数字端口" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_nginx_port",
+        "label": "前端端口",
+        "rules": [
+          { "pattern": "^[0-9]+$", "message": "请输入数字端口" }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "管理员密码",
+    "items": [
+      {
+        "type": "password",
+        "field": "wizard_superuser_password",
+        "label": "重置超级管理员密码（留空则不修改；填写时需含字母、数字、特殊字符中至少两类）",
+        "rules": [
+          { "max": 50, "message": "密码长度不能超过 50 位" },
+          { "pattern": "^(?:(?=.*[A-Za-z])(?=.*[0-9])|(?=.*[A-Za-z])(?=.*[^A-Za-z0-9])|(?=.*[0-9])(?=.*[^A-Za-z0-9])).+$", "message": "密码需至少包含字母、数字、特殊字符中的两类" }
+        ]
+      }
+    ]
+  }
+]

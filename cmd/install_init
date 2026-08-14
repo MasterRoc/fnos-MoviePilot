@@ -1,0 +1,39 @@
+#!/bin/bash
+### MoviePilot 安装前检查
+set -u
+
+PYTHON_BIN="/var/apps/python312/target/bin/python3"
+NODE_BIN="/var/apps/nodejs_v24/target/bin"
+
+# 检查依赖运行时是否存在
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "缺少 Python 3.12 运行时（依赖 python312 未安装）" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+if [ ! -x "$NODE_BIN/node" ]; then
+    echo "缺少 Node.js 运行时（依赖 nodejs_v24 未安装）" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+
+# 校验向导必填项：管理员密码（与 MoviePilot 官方 _validate_superuser_password 一致）
+PW="${wizard_superuser_password:-}"
+if [ -z "$PW" ]; then
+    echo "请填写超级管理员密码" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+# 密码长度 6-50
+if [ ${#PW} -lt 6 ] || [ ${#PW} -gt 50 ]; then
+    echo "超级管理员密码长度需在 6-50 位之间" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+# 需包含字母、数字、特殊字符中的至少两类
+HAS_LETTER=$(printf '%s' "$PW" | grep -qE '[A-Za-z]' && echo 1 || echo 0)
+HAS_DIGIT=$(printf '%s' "$PW" | grep -qE '[0-9]' && echo 1 || echo 0)
+HAS_SPECIAL=$(printf '%s' "$PW" | grep -qE '[^A-Za-z0-9]' && echo 1 || echo 0)
+CLASSES=$((HAS_LETTER + HAS_DIGIT + HAS_SPECIAL))
+if [ "$CLASSES" -lt 2 ]; then
+    echo "超级管理员密码需至少包含字母、数字、特殊字符中的两类（如：MoviePilot@2026）" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+
+exit 0

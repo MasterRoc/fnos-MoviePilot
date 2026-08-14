@@ -1,0 +1,31 @@
+appname               = moviepilot
+version               = 1.0.0
+display_name          = MoviePilot
+desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。<br><br>🐛 <b>问题反馈：</b><a href="https://github.com/jxxghp/MoviePilot/issues" target="_blank">GitHub Issues</a>
+
+# 系统要求
+platform              = all
+os_min_version        = 1.1.3104
+source                = thirdparty
+
+# 开发者信息
+maintainer            = MoviePilot
+maintainer_url        = https://github.com/jxxghp/MoviePilot
+distributor           = yukihana
+distributor_url       = https://github.com/sushazhi/fnos-MoviePilot
+
+# 安装控制
+ctl_stop              = true
+
+# JS SDK 支持
+micro_app             = true
+
+# 桌面图标配置
+desktop_uidir         = ui
+desktop_applaunchname = moviepilot.Application
+
+# 依赖运行时
+install_dep_apps      = python312:nodejs_v24
+
+# 更新日志
+changelog             = v1.0.0<br>1.初始版本

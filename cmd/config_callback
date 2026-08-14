@@ -1,0 +1,65 @@
+#!/bin/bash
+### MoviePilot 配置变更后
+### 读取向导值并更新 app.env，随后重启服务使配置生效
+set -u
+
+APP_NAME="moviepilot"
+CONFIG_DIR="${TRIM_PKGVAR}/config"
+ENV_FILE="${CONFIG_DIR}/app.env"
+MP_SRC="${TRIM_APPDEST}/mp"
+BIN_DIR="${TRIM_APPDEST}/bin"
+
+# venv 解析：优先使用构建时打包进包的 venv，否则用安装时在线创建的
+if [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
+    VENV_DIR="${TRIM_APPDEST}/venv"
+else
+    VENV_DIR="${TRIM_PKGVAR}/venv"
+fi
+
+mkdir -p "${CONFIG_DIR}"
+
+# 确保 app.env 对运行用户可写（sed -i 会创建临时文件再 rename，文件不可写会失败）。
+# install/upgrade 后文件可能属 root 且权限 644，后端/配置回调可能以非 root 用户执行。
+if [ -f "${ENV_FILE}" ]; then
+    chmod 666 "${ENV_FILE}" 2>/dev/null || true
+fi
+chmod 777 "${CONFIG_DIR}" 2>/dev/null || true
+
+# 更新端口（如果向导提供）
+if [ -n "${wizard_port:-}" ]; then
+    # 更新或追加 PORT
+    if grep -q '^PORT=' "${ENV_FILE}" 2>/dev/null; then
+        sed -i "s/^PORT=.*/PORT=${wizard_port}/" "${ENV_FILE}"
+    else
+        echo "PORT=${wizard_port}" >> "${ENV_FILE}"
+    fi
+fi
+if [ -n "${wizard_nginx_port:-}" ]; then
+    if grep -q '^NGINX_PORT=' "${ENV_FILE}" 2>/dev/null; then
+        sed -i "s/^NGINX_PORT=.*/NGINX_PORT=${wizard_nginx_port}/" "${ENV_FILE}"
+    else
+        echo "NGINX_PORT=${wizard_nginx_port}" >> "${ENV_FILE}"
+    fi
+fi
+
+# 更新超级管理员密码（如向导要求修改）
+if [ -n "${wizard_superuser_password:-}" ]; then
+    if grep -q '^SUPERUSER_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then
+        sed -i "s|^SUPERUSER_PASSWORD=.*|SUPERUSER_PASSWORD=${wizard_superuser_password}|" "${ENV_FILE}"
+    else
+        echo "SUPERUSER_PASSWORD=${wizard_superuser_password}" >> "${ENV_FILE}"
+    fi
+    # 同步到 MoviePilot 用户库（复用同一个初始化脚本，幂等）
+    INIT_SCRIPT="${BIN_DIR}/mp_init_superuser.py"
+    if [ -x "${VENV_DIR}/bin/python" ] && [ -f "${INIT_SCRIPT}" ]; then
+        CONFIG_DIR="${CONFIG_DIR}" MP_SRC="${MP_SRC}" LOG_FILE="${TRIM_PKGVAR}/config.log" \
+            "${VENV_DIR}/bin/python" "${INIT_SCRIPT}" >> "${TRIM_PKGVAR}/config.log" 2>&1
+    fi
+fi
+
+# 若应用正在运行，则重启使配置生效
+if "${TRIM_APPDEST}/cmd/main" status >/dev/null 2>&1; then
+    "${TRIM_APPDEST}/cmd/main" restart
+fi
+
+exit 0

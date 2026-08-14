@@ -1,0 +1,169 @@
+#!/bin/bash
+### MoviePilot fnOS 原生应用 - 生命周期控制（start/stop/status）
+### 统一由 supervisor.py（Python 主管进程）管理后端/前端/网关代理三个服务。
+### fnOS 只追踪 supervisor 一个主进程，避免子进程被 fnOS 进程管理清理。
+set -u
+
+APP_NAME="moviepilot"
+PYTHON_BIN="/var/apps/python312/target/bin/python3"
+export PATH="/var/apps/nodejs_v24/target/bin:${PATH}"
+
+MP_SRC="${TRIM_APPDEST}/mp"
+BIN_DIR="${TRIM_APPDEST}/bin"
+FRONTEND_DIR="${TRIM_APPDEST}/frontend"
+CONFIG_DIR="${TRIM_PKGVAR}/config"
+
+# venv 解析：优先用打包的，否则用安装时创建的
+if [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
+    VENV_DIR="${TRIM_APPDEST}/venv"
+else
+    VENV_DIR="${TRIM_PKGVAR}/venv"
+fi
+
+SUPERVISOR="${BIN_DIR}/supervisor.py"
+SUPER_PID_FILE="${TRIM_PKGTMP}/${APP_NAME}-super.pid"
+LOG_FILE="${TRIM_PKGVAR}/${APP_NAME}.log"
+GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
+
+# 共享目录（用于写诊断日志，trim-cli 可读取）
+SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+SHARE_LOG="${SHARE_DIR}/${APP_NAME}-supervisor.log"
+
+# 端口（从 app.env 读取）
+BACKEND_PORT=3002
+FRONTEND_PORT=3005
+if [ -f "${CONFIG_DIR}/app.env" ]; then
+    v=$(grep -E '^PORT=' "${CONFIG_DIR}/app.env" | tail -1 | cut -d= -f2)
+    [ -n "$v" ] && BACKEND_PORT="$v"
+    v=$(grep -E '^NGINX_PORT=' "${CONFIG_DIR}/app.env" | tail -1 | cut -d= -f2)
+    [ -n "$v" ] && FRONTEND_PORT="$v"
+fi
+
+LOG_MAX_SIZE=2097152
+LOG_MAX_FILES=3
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+
+is_pid_alive() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
+rotate_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$LOG_MAX_SIZE" ]; then
+            [ -f "${LOG_FILE}.${LOG_MAX_FILES}" ] && rm -f "${LOG_FILE}.${LOG_MAX_FILES}"
+            for i in $(seq $((LOG_MAX_FILES - 1)) -1 1); do
+                [ -f "${LOG_FILE}.${i}" ] && mv "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
+            done
+            mv "$LOG_FILE" "${LOG_FILE}.1"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Log rotated" > "$LOG_FILE"
+        fi
+    fi
+}
+
+get_super_pid() {
+    if [ -f "$SUPER_PID_FILE" ]; then
+        p=$(cat "$SUPER_PID_FILE" 2>/dev/null)
+        if is_pid_alive "$p"; then
+            echo "$p"
+            return
+        fi
+    fi
+    pgrep -f "supervisor.py" 2>/dev/null | head -1
+}
+
+is_running() {
+    p=$(get_super_pid)
+    [ -n "$p" ]
+}
+
+start_app() {
+    if is_running; then
+        return 0
+    fi
+    if [ ! -f "$SUPERVISOR" ]; then
+        echo "错误：主管进程脚本不存在" > "$TRIM_TEMP_LOGFILE"
+        return 1
+    fi
+    if [ ! -x "${VENV_DIR}/bin/python" ]; then
+        echo "错误：Python 虚拟环境不存在，请重新安装应用" > "$TRIM_TEMP_LOGFILE"
+        return 1
+    fi
+    rm -f "$GATEWAY_SOCK"
+    log "启动主管进程 ..."
+    nohup env \
+        MP_SRC="$MP_SRC" VENV_DIR="$VENV_DIR" BIN_DIR="$BIN_DIR" \
+        FRONTEND_DIR="$FRONTEND_DIR" CONFIG_DIR="$CONFIG_DIR" \
+        BACKEND_PORT="$BACKEND_PORT" FRONTEND_PORT="$FRONTEND_PORT" \
+        GATEWAY_SOCK="$GATEWAY_SOCK" LOG_FILE="$LOG_FILE" \
+        SHARE_LOG="$SHARE_LOG" PYTHON_BIN="$PYTHON_BIN" \
+        "${VENV_DIR}/bin/python" "$SUPERVISOR" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$SUPER_PID_FILE"
+    disown 2>/dev/null || true
+    # 确认主管进程存活
+    local i=0
+    while [ $i -lt 20 ]; do   # 最长 10 秒
+        if is_pid_alive "$(cat "$SUPER_PID_FILE")"; then
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "错误：主管进程启动失败" > "$TRIM_TEMP_LOGFILE"
+    tail -20 "$LOG_FILE" >> "$TRIM_TEMP_LOGFILE"
+    rm -f "$SUPER_PID_FILE"
+    return 1
+}
+
+stop_app() {
+    p=$(get_super_pid)
+    if [ -n "$p" ]; then
+        log "停止主管进程 pid=$p ..."
+        kill "$p" 2>/dev/null || true
+        local timeout=30
+        while is_pid_alive "$p" && [ $timeout -gt 0 ]; do
+            sleep 1
+            timeout=$((timeout - 1))
+        done
+        is_pid_alive "$p" && kill -9 "$p" 2>/dev/null || true
+    fi
+    # 兜底：清理残留的后端/前端/代理进程
+    pgrep -f "app/main.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "frontend-server.js" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "gateway-proxy.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    rm -f "$SUPER_PID_FILE" "$GATEWAY_SOCK"
+}
+
+mkdir -p "$TRIM_PKGTMP"
+rotate_logs
+
+case "${1:-}" in
+start)
+    log "=== start ==="
+    start_app || exit 1
+    log "=== started ==="
+    exit 0
+    ;;
+stop)
+    log "=== stop ==="
+    stop_app
+    log "=== stopped ==="
+    exit 0
+    ;;
+restart)
+    "$0" stop
+    sleep 2
+    "$0" start
+    ;;
+status)
+    if is_running; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart|status}" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+esac

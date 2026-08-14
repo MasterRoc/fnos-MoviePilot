@@ -1,0 +1,12 @@
+#!/bin/bash
+### MoviePilot 配置变更前
+set -u
+
+# 校验管理员密码（如向导要求修改）
+if [ -n "${wizard_superuser_password:-}" ]; then
+    if [ ${#wizard_superuser_password} -lt 6 ]; then
+        echo "管理员密码长度不能小于 6 位" > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
+fi
+exit 0

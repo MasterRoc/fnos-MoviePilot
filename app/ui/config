@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "moviepilot.Application": {
+      "title": "MoviePilot",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/moviepilot",
+      "gatewaySocket": "moviepilot.sock",
+      "url": "/app/moviepilot",
+      "allUsers": true
+    }
+  }
+}

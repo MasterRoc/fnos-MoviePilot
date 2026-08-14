@@ -1,0 +1,195 @@
+#!/bin/bash
+### MoviePilot 安装后初始化
+### 依赖 fnOS python312 / nodejs_v24 运行时，需 NAS 可访问外网（pip 安装 Python 依赖）
+set -u
+
+PYTHON_BIN="/var/apps/python312/target/bin/python3"
+NODE_BIN="/var/apps/nodejs_v24/target/bin"
+export PATH="${NODE_BIN}:${PATH}"
+
+MP_SRC="${TRIM_APPDEST}/mp"                # MoviePilot 后端源码（打包时内置）
+CONFIG_DIR="${TRIM_PKGVAR}/config"         # MoviePilot 配置目录
+FRONTEND_DIR="${TRIM_APPDEST}/frontend"    # 前端 dist 目录（打包时内置）
+BIN_DIR="${TRIM_APPDEST}/bin"              # 辅助脚本目录（打包时内置）
+ENV_FILE="${CONFIG_DIR}/app.env"
+
+# venv 解析：优先使用构建时打包进包的 venv（安装时不联网），否则安装时在线创建
+BUNDLED_VENV="${TRIM_APPDEST}/venv"
+ONLINE_VENV="${TRIM_PKGVAR}/venv"
+if [ -x "${BUNDLED_VENV}/bin/python" ]; then
+    VENV_DIR="${BUNDLED_VENV}"
+    VENV_BUNDLED=1
+else
+    VENV_DIR="${ONLINE_VENV}"
+    VENV_BUNDLED=0
+fi
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${TRIM_PKGVAR}/install.log"; }
+fail() { echo "$1" > "$TRIM_TEMP_LOGFILE"; log "ERROR: $1"; exit 1; }
+
+mkdir -p "${CONFIG_DIR}" "${FRONTEND_DIR}"
+
+log "=== MoviePilot 安装初始化开始 ==="
+
+# 1. 生成 app.env（环境变量文件，供后端读取）
+API_TOKEN="${wizard_api_token:-}"
+if [ -z "${API_TOKEN}" ] || [ ${#API_TOKEN} -lt 16 ]; then
+    API_TOKEN="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32)"
+fi
+PORT="${wizard_port:-3002}"
+NGINX_PORT="${wizard_nginx_port:-3005}"
+
+cat > "${ENV_FILE}" <<EOF
+# MoviePilot fnOS 环境配置
+CONFIG_DIR=${CONFIG_DIR}
+HOST=127.0.0.1
+PORT=${PORT}
+NGINX_PORT=${NGINX_PORT}
+DB_TYPE=sqlite
+API_TOKEN=${API_TOKEN}
+SUPERUSER=${wizard_superuser:-admin}
+SUPERUSER_PASSWORD=${wizard_superuser_password}
+# GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时
+GITHUB_PROXY=https://gh-proxy.com/
+EOF
+
+log "app.env 已生成：${ENV_FILE}"
+
+# 确保 app.env 对运行后端进程的用户可写（防止后端调用 set_key/unset_key 时
+# 因文件属主/权限问题抛出 PermissionError）。@appdata 由安装流程以 root 创建，
+# 后端可能以非 root 用户运行，这里放宽文件权限到 666。
+chmod 666 "${ENV_FILE}" 2>/dev/null || true
+
+# 2. 准备 Python 虚拟环境
+if [ "${VENV_BUNDLED}" = "1" ]; then
+    # 构建时已打包 venv，安装时不联网
+    log "使用构建时打包的 Python 环境（无需联网安装依赖）"
+else
+    log "创建 Python 虚拟环境 ..."
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}" >> "${TRIM_PKGVAR}/install.log" 2>&1 \
+        || fail "Python 虚拟环境创建失败"
+fi
+
+# 3. 安装 Python 依赖（耗时长，使用国内加速源，自动回退）
+#    - pip 镜像源优先级（按实测下载速度排序）：清华 → 阿里云 → 腾讯云 → 官方 PyPI
+#    - Playwright 浏览器（cloakbrowser 依赖）走国内镜像，避免 Chromium 下载卡死
+#    - npmmirror 官方二进制源（registry.npmmirror.com/-/binary/），实测含 ARM chromium zip
+#    - 每个镜像带 --timeout / --retries，避免网络不可达时无限挂起"卡安装"
+PIP_MIRRORS=(
+    "https://pypi.tuna.tsinghua.edu.cn/simple/"
+    "https://mirrors.aliyun.com/pypi/simple/"
+    "https://mirrors.cloud.tencent.com/pypi/simple/"
+    "https://pypi.org/simple/"
+)
+PIP_TIMEOUT=30
+PIP_RETRIES=3
+
+# Playwright / 浏览器二进制走国内镜像
+# 注意：Playwright 拼接规则为 {HOST}/builds/{browser}/{rev}/{file}，
+#       因此 HOST 必须为"下载根"（含 playwright 路径、不含 builds/chromium、末尾不带斜杠）
+PLAYWRIGHT_MIRRORS=(
+    "https://registry.npmmirror.com/-/binary/playwright"
+    "https://mirrors.huaweicloud.com/playwright"
+)
+for _pw in "${PLAYWRIGHT_MIRRORS[@]}"; do
+    if curl -fsI --connect-timeout 5 --max-time 8 "${_pw}" >/dev/null 2>&1; then
+        export PLAYWRIGHT_DOWNLOAD_HOST="${_pw}"
+        log "Playwright 浏览器镜像：${_pw}"
+        break
+    fi
+done
+export PLAYWRIGHT_BROWSERS_PATH="${TRIM_PKGVAR}/browsers"   # 浏览器缓存到数据目录，避免被清理
+
+pip_mirror_host() {
+    echo "$1" | sed -E 's#https?://([^/]+)/.*#\1#'
+}
+
+pip_install() {
+    # $1 = pip 子命令参数，逐个镜像尝试，成功即返回
+    local args="$1"
+    for mirror in "${PIP_MIRRORS[@]}"; do
+        log "尝试 pip 镜像源：${mirror}"
+        if "${VENV_DIR}/bin/pip" install ${args} \
+                -i "${mirror}" \
+                --trusted-host "$(pip_mirror_host "${mirror}")" \
+                --timeout "${PIP_TIMEOUT}" \
+                --retries "${PIP_RETRIES}" \
+                >> "${TRIM_PKGVAR}/install.log" 2>&1; then
+            return 0
+        fi
+        log "pip 镜像源失败，切换到下一个"
+    done
+    return 1
+}
+
+# 安全清理 venv 缓存/元数据，减小占用（不影响运行，运行时按需自动重建）。
+# 仅删除 __pycache__ 目录、*.pyc / *.pyo 字节码、*.dist-info / *.egg-info 元数据，
+# 绝不触碰 .so/.pyd/.dylib/.dll 二进制及包本体。
+trim_venv_cache() {
+    local venv_dir="$1"
+    [ -n "${venv_dir}" ] || return 0
+    [ -d "${venv_dir}" ] || return 0
+    log "清理 venv 缓存/元数据（__pycache__/*.pyc/*.dist-info）..."
+    # 删除所有 __pycache__ 目录（rm -rf 递归删除，无需 -prune）
+    find "${venv_dir}" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+    # 删除所有 .pyc / .pyo 字节码
+    find "${venv_dir}" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete 2>/dev/null
+    # 删除 .dist-info / .egg-info 元数据目录
+    find "${venv_dir}" -type d \( -name "*.dist-info" -o -name "*.egg-info" \) -exec rm -rf {} + 2>/dev/null
+    log "venv 缓存清理完成"
+}
+
+if [ "${VENV_BUNDLED}" = "1" ]; then
+    : # 构建时已打包依赖（build.py 的 _trim_venv 已清理过缓存），跳过在线安装
+elif [ ! -f "${VENV_DIR}/.deps_done" ]; then
+    log "安装 Python 依赖（可能需要数分钟，使用加速源）..."
+    # 先升级 pip（仅第一个可达镜像，带超时；失败不阻塞主安装）
+    "${VENV_DIR}/bin/pip" install --upgrade pip \
+        -i "${PIP_MIRRORS[0]}" \
+        --trusted-host "$(pip_mirror_host "${PIP_MIRRORS[0]}")" \
+        --timeout "${PIP_TIMEOUT}" \
+        >> "${TRIM_PKGVAR}/install.log" 2>&1 || log "pip 升级失败（可忽略，继续安装依赖）"
+    pip_install "-r ${MP_SRC}/requirements.txt" \
+        || fail "Python 依赖安装失败，请检查网络后重试（详见安装日志）"
+    touch "${VENV_DIR}/.deps_done"
+    # 安全清理在线安装的 venv 缓存/元数据（__pycache__/*.pyc/*.dist-info）。
+    # 仅删纯缓存，不碰 .so/.pyd 与包本体，运行时按需自动重建，无功能影响；
+    # 实测可释放在线 venv 约 12%~18% 磁盘（百 MB 级）。
+    trim_venv_cache "${VENV_DIR}"
+fi
+
+# 4. 初始化数据库 + 创建超级管理员
+log "初始化数据库与超级管理员 ..."
+INIT_SCRIPT="${BIN_DIR}/mp_init_superuser.py"
+if [ ! -f "${INIT_SCRIPT}" ]; then
+    fail "初始化脚本不存在：${INIT_SCRIPT}"
+fi
+# 同时输出到共享目录错误文件（便于诊断，trim-cli 可读取）
+SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+ERR_OUT="${SHARE_DIR}/moviepilot-init-error.log"
+: > "${ERR_OUT}"
+CONFIG_DIR="${CONFIG_DIR}" MP_SRC="${MP_SRC}" LOG_FILE="${TRIM_PKGVAR}/install.log" \
+    "${VENV_DIR}/bin/python" "${INIT_SCRIPT}" 2>&1 | tee -a "${TRIM_PKGVAR}/install.log" "${ERR_OUT}"
+INIT_RC=${PIPESTATUS[0]}
+if [ "${INIT_RC}" -ne 0 ]; then
+    # 失败：把详细日志写入 TRIM_TEMP_LOGFILE（注意 fail 会覆盖，这里手动写入完整错误后 exit）
+    {
+        echo "超级管理员初始化失败，最近日志："
+        echo "--------------------------------------------------"
+        tail -n 60 "${TRIM_PKGVAR}/install.log" 2>/dev/null
+        echo "--------------------------------------------------"
+        echo "详细错误已保存到共享目录：${ERR_OUT}"
+    } > "$TRIM_TEMP_LOGFILE"
+    log "ERROR: 超级管理员初始化失败，详见 ${ERR_OUT}"
+    exit 1
+fi
+rm -f "${ERR_OUT}"
+
+# 5. 记录数据目录配置到共享目录（供后续引用）
+cat > "${CONFIG_DIR}/paths.conf" <<EOF
+download=${TRIM_DATA_SHARE_PATHS}
+media=${TRIM_DATA_SHARE_PATHS}
+EOF
+
+log "=== MoviePilot 安装初始化完成 ==="
+exit 0

@@ -1,0 +1,20 @@
+#!/bin/bash
+### MoviePilot 升级前：备份配置与数据到持久共享目录
+set -u
+
+APP_NAME="moviepilot"
+CONFIG_DIR="${TRIM_PKGVAR}/config"
+DATA_SHARE="${TRIM_DATA_SHARE_PATHS%%:*}"
+BACKUP_DIR="${DATA_SHARE}/.moviepilot_backup"
+
+# 停服务（由 fnOS 流程管理，这里确保停止）
+"${TRIM_APPDEST}/cmd/main" stop >/dev/null 2>&1 || true
+
+# 备份配置（含 SQLite 数据库）
+if [ -d "${CONFIG_DIR}" ]; then
+    mkdir -p "${BACKUP_DIR}"
+    cp -a "${CONFIG_DIR}" "${BACKUP_DIR}/config" 2>/dev/null || \
+        cp -r "${CONFIG_DIR}" "${BACKUP_DIR}/config"
+    echo "备份完成：${BACKUP_DIR}" >> "${TRIM_PKGVAR}/upgrade.log"
+fi
+exit 0

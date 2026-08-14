@@ -1,0 +1,24 @@
+{
+    "data-share": {
+        "shares": [
+            {
+                "name": "moviepilot",
+                "permission": {
+                    "rw": ["moviepilot"]
+                }
+            },
+            {
+                "name": "moviepilot/downloads",
+                "permission": {
+                    "rw": ["moviepilot"]
+                }
+            },
+            {
+                "name": "moviepilot/media",
+                "permission": {
+                    "rw": ["moviepilot"]
+                }
+            }
+        ]
+    }
+}

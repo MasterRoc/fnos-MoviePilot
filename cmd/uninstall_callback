@@ -1,0 +1,16 @@
+#!/bin/bash
+### MoviePilot 卸载后清理
+### wizard_data_action=keep 时保留数据；=delete 时删除
+set -u
+
+APP_NAME="moviepilot"
+
+if [ "${wizard_data_action:-keep}" = "delete" ]; then
+    # 删除数据目录（配置、数据库、venv、日志）
+    rm -rf "${TRIM_PKGVAR}/config" "${TRIM_PKGVAR}/venv" "${TRIM_PKGVAR}/${APP_NAME}.log" \
+           "${TRIM_PKGVAR}/install.log" "${TRIM_PKGVAR}/config.log" "${TRIM_PKGVAR}/upgrade.log"
+    # 删除共享目录中的备份
+    DATA_SHARE="${TRIM_DATA_SHARE_PATHS%%:*}"
+    rm -rf "${DATA_SHARE}/.moviepilot_backup"
+fi
+exit 0

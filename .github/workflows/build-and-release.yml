@@ -1,0 +1,126 @@
+name: Build and Release MoviePilot for fnOS
+
+on:
+  push:
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop, test ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build MoviePilot - ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Read version from manifest
+        run: |
+          APP_VERSION=$(grep "^version\s*=" manifest | sed 's/version\s*=\s*//' | tr -d ' ')
+          echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
+          echo "APP_VERSION=${APP_VERSION}"
+
+      - name: Build .fpk (with bundled venv)
+        # --with-venv 会把 Python 依赖 venv 打进包，安装时完全无需联网
+        # 在 ubuntu runner 上构建，架构与目标 NAS 一致（arm64/amd64）
+        # build.py 自动在 .local-build/pkg 组装干净目录树再打包
+        run: |
+          python build.py --with-venv
+
+          if [ ! -f "moviepilot-${APP_VERSION}.fpk" ]; then
+            echo "ERROR: fnpack did not generate moviepilot-${APP_VERSION}.fpk"
+            ls -la *.fpk || true
+            exit 1
+          fi
+
+          # 产物名带架构后缀，便于区分与发布
+          PACKAGE_NAME="moviepilot-${APP_VERSION}-${{ matrix.arch }}.fpk"
+          mv "moviepilot-${APP_VERSION}.fpk" "${PACKAGE_NAME}"
+          echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+          echo "Created package: ${PACKAGE_NAME}"
+          ls -lh "${PACKAGE_NAME}"
+
+      - name: Create SHA256 checksums
+        run: |
+          sha256sum "${PACKAGE_NAME}" > "${PACKAGE_NAME}.sha256sum"
+          cat "${PACKAGE_NAME}.sha256sum"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoviePilot-${{ matrix.arch }}-fpk
+          path: |
+            ${{ env.PACKAGE_NAME }}
+            ${{ env.PACKAGE_NAME }}.sha256sum
+          retention-days: 30
+
+      - name: Build summary
+        run: |
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## ✅ Build Summary - ${{ matrix.arch }}
+
+          **Version:** ${{ env.APP_VERSION }}
+          **Architecture:** ${{ matrix.arch }}
+          **Bundled venv:** yes (安装时无需联网)
+
+          **Git Info:**
+          - Commit: \`${{ github.sha }}\`
+          - Branch: \`${{ github.ref_name }}\`
+
+          **Package:** \`${PACKAGE_NAME}\`
+          EOF
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Read version from manifest
+        run: |
+          APP_VERSION=$(grep "^version\s*=" manifest | sed 's/version\s*=\s*//' | tr -d ' ')
+          echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
+
+      - name: Publish Release with Changelog
+        run: |
+          CHANGELOG=$(grep "^changelog" manifest | sed 's/changelog\s*=\s*//' | sed 's/<br>/\n/g')
+          TAG="${{ github.ref_name }}"
+
+          echo "Publishing release..."
+          gh release create "$TAG" \
+            artifacts/MoviePilot-arm64-fpk/*.fpk \
+            artifacts/MoviePilot-arm64-fpk/*.sha256sum \
+            artifacts/MoviePilot-amd64-fpk/*.fpk \
+            artifacts/MoviePilot-amd64-fpk/*.sha256sum \
+            --title "$TAG" \
+            --notes "$CHANGELOG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

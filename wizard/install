@@ -1,0 +1,51 @@
+[
+  {
+    "stepTitle": "管理员账号",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_superuser",
+        "label": "超级管理员用户名",
+        "initValue": "admin",
+        "rules": [
+          { "required": true, "message": "请输入超级管理员用户名" },
+          { "pattern": "^[a-zA-Z0-9_]{1,64}$", "message": "用户名仅限字母、数字、下划线，不超过 64 位" }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_superuser_password",
+        "label": "超级管理员密码（6-50位，需含字母、数字、特殊字符中至少两类）",
+        "rules": [
+          { "required": true, "message": "请输入超级管理员密码" },
+          { "min": 6, "message": "密码长度不能小于 6 位" },
+          { "max": 50, "message": "密码长度不能超过 50 位" },
+          { "pattern": "^(?:(?=.*[A-Za-z])(?=.*[0-9])|(?=.*[A-Za-z])(?=.*[^A-Za-z0-9])|(?=.*[0-9])(?=.*[^A-Za-z0-9])).+$", "message": "密码需至少包含字母、数字、特殊字符中的两类（如 MoviePilot@2026）" }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "服务端口",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "后端 API 端口（默认 3002）",
+        "initValue": "3002",
+        "rules": [
+          { "pattern": "^[0-9]+$", "message": "请输入数字端口" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_nginx_port",
+        "label": "前端端口（默认 3005，请避开系统已占用端口）",
+        "initValue": "3005",
+        "rules": [
+          { "pattern": "^[0-9]+$", "message": "请输入数字端口" }
+        ]
+      }
+    ]
+  }
+]
