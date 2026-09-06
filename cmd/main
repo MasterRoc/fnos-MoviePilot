@@ -25,9 +25,13 @@ SUPER_PID_FILE="${TRIM_PKGTMP}/${APP_NAME}-super.pid"
 LOG_FILE="${TRIM_PKGVAR}/${APP_NAME}.log"
 GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
 
-# 共享目录（用于写诊断日志，trim-cli 可读取）
-SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
-SHARE_LOG="${SHARE_DIR}/${APP_NAME}-supervisor.log"
+# 共享目录（用于写诊断日志，trim-cli 可读取）；未导出时跳过共享日志
+SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
+if [ -n "$SHARE_PATHS" ]; then
+    SHARE_LOG="${SHARE_PATHS%%:*}/${APP_NAME}-supervisor.log"
+else
+    SHARE_LOG=""
+fi
 
 # 端口（从 app.env 读取）
 BACKEND_PORT=3002
@@ -70,7 +74,8 @@ get_super_pid() {
             return
         fi
     fi
-    pgrep -f "supervisor.py" 2>/dev/null | head -1
+    # 带 bin/ 路径前缀，避免误匹配其他应用的 supervisor.py
+    pgrep -f "bin/supervisor\.py" 2>/dev/null | head -1
 }
 
 is_running() {
@@ -129,9 +134,10 @@ stop_app() {
         is_pid_alive "$p" && kill -9 "$p" 2>/dev/null || true
     fi
     # 兜底：清理残留的后端/前端/代理进程
-    pgrep -f "app/main.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    pgrep -f "frontend-server.js" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    pgrep -f "gateway-proxy.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    # 模式带 bin/、mp/ 路径前缀（后端为绝对路径启动），避免误杀其他应用的同名进程
+    pgrep -f "mp/app/main\.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "bin/frontend-server\.js" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "bin/gateway-proxy\.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     rm -f "$SUPER_PID_FILE" "$GATEWAY_SOCK"
 }
 

@@ -81,11 +81,13 @@ def _cleanup_stale_backend():
     会出现 SQLITE_IOERR_SHORT_READ / disk I/O error 等偶发并发 I/O 错误。
 
     注意：MoviePilot 后端进程启动后会 setproctitle 改名为 "MoviePilot"，
-    因此用 pgrep "app/main.py" 抓不到改名后的残留进程。这里按进程名(comm)精确匹配
-    "MoviePilot" 或命令行含 "app/main.py" 的进程，避免误伤 supervisor/gateway/frontend
-    （它们的命令行虽含 /appcenter/moviepilot/ 路径，但进程名不是 MoviePilot）。
+    因此用 pgrep "app/main.py" 抓不到改名后的残留进程。这里按两路匹配：
+      - comm 精确等于 "MoviePilot"（改名后的进程）
+      - 命令行含本应用的 mp/app/main.py 绝对路径（尚未改名的进程）
+    匹配只用本应用 MP_SRC 下的精确路径，避免误杀其他应用的同名脚本进程。
     """
     my_pid = os.getpid()
+    backend_script = os.path.join(MP_SRC, "app", "main.py")
     pids = []
     try:
         out = subprocess.check_output(
@@ -93,15 +95,18 @@ def _cleanup_stale_backend():
             stderr=subprocess.DEVNULL,
         ).decode()
         for line in out.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) < 1:
+            # ps 每行是 "pid comm args" 三列，必须 split(None, 2) 才能单独取出
+            # comm；split(None, 1) 会把 args 拼进 comm，导致 "MoviePilot"
+            # 精确匹配永不成立，改名后的残留进程漏杀。
+            parts = line.split(None, 2)
+            if len(parts) < 2:
                 continue
-            pid = parts[0].strip()
+            pid = parts[0]
             if not pid.isdigit() or int(pid) == my_pid:
                 continue
-            rest = line[len(pid):].strip()
-            comm = parts[1] if len(parts) > 1 else ""
-            if comm == "MoviePilot" or "app/main.py" in rest:
+            comm = parts[1]
+            args = parts[2] if len(parts) > 2 else ""
+            if comm == "MoviePilot" or backend_script in args:
                 pids.append(int(pid))
     except Exception:
         pids = []
@@ -134,11 +139,11 @@ def _cleanup_stale_frontend():
     """清理残留的前端进程，避免旧前端仍占用 FRONTEND_PORT(TCP 3005)，
     导致新前端启动时 listen EADDRINUSE 而立即退出，引发 supervisor 重启风暴。
 
-    前端进程名通常是 node，但命令行含 "frontend-server.js"，据此精确匹配，
-    避免误伤后端/网关代理（命令行虽含 /appcenter/moviepilot/ 路径但不含
-    frontend-server.js）。
+    前端进程名是 node，只能按命令行匹配本应用 BIN_DIR 下 frontend-server.js
+    的精确路径，避免误伤其他应用的 node 进程。
     """
     my_pid = os.getpid()
+    frontend_script = os.path.join(BIN_DIR, "frontend-server.js")
     pids = []
     try:
         out = subprocess.check_output(
@@ -152,7 +157,7 @@ def _cleanup_stale_frontend():
             pid, _, rest = line.partition(" ")
             if not pid.isdigit() or int(pid) == my_pid:
                 continue
-            if "frontend-server.js" in rest:
+            if frontend_script in rest:
                 pids.append(int(pid))
     except Exception:
         pids = []
@@ -194,8 +199,9 @@ def start_backend():
         "PORT": BACKEND_PORT,
     })
     try:
+        # 绝对路径启动，便于残留进程清理与 stop 兜底用命令行精确定位本应用后端
         proc = subprocess.Popen(
-            [py, "app/main.py"],
+            [py, os.path.join(MP_SRC, "app", "main.py")],
             cwd=MP_SRC,
             env=env,
             stdout=_backend_out(),

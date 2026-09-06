@@ -34,6 +34,7 @@ import shutil
 import argparse
 import hashlib
 import platform
+import re
 import subprocess
 import urllib.request
 from pathlib import Path
@@ -112,6 +113,20 @@ def get_app_version():
     sys.exit(1)
 
 
+def get_runtime_pyver():
+    """从 manifest install_dep_apps 读取依赖运行时 Python 版本（python312 -> "312"）。"""
+    manifest_file = PROJECT_DIR / "manifest"
+    try:
+        for line in manifest_file.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("install_dep_apps") and "=" in line:
+                m = re.search(r"python(\d{3})", line)
+                if m:
+                    return m.group(1)
+    except Exception as e:
+        log(f"警告: 读取 install_dep_apps 失败，使用默认 312: {e}")
+    return "312"
+
+
 def get_frontend_version():
     """从后端 version.py 的 FRONTEND_VERSION 自动读取前端版本，保证前端版本与后端要求始终一致。
 
@@ -154,21 +169,31 @@ def get_backend_version():
 # 下载（直连 -> 代理降级）
 # ---------------------------------------------------------------------------
 def download(url, out_file, force=False):
-    """下载顺序：直连 -> gh-proxy -> ghfast，任一成功即返回。"""
+    """下载顺序：直连 -> gh-proxy -> ghfast，任一成功即返回。
+
+    先写 .part 临时文件、成功后原子改名：直接写目标文件时，中途失败的
+    残缺文件会在下次构建被"已存在且非空"检查误判为完整产物。
+    """
     out_file = Path(out_file)
     if out_file.exists() and out_file.stat().st_size > 0 and not force:
         return True
+    tmp = out_file.with_name(out_file.name + ".part")
     urls = [url, f"{MAIN_PROXY}{url}", f"{ALT_PROXY}{url}"]
     for i, u in enumerate(urls):
         tag = "直连" if i == 0 else ("加速(gh-proxy)" if i == 1 else "加速(ghfast)")
         log(f"  [{tag}] {u}")
         try:
             req = urllib.request.Request(u, headers={"User-Agent": "MoviePilot-fnOS-build"})
-            with urllib.request.urlopen(req, timeout=60) as resp, open(out_file, "wb") as f:
+            with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
                 shutil.copyfileobj(resp, f)
+            tmp.replace(out_file)
             return True
         except Exception as e:
             log(f"  {tag}失败，尝试下一个: {e}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     return False
 
 
@@ -292,6 +317,75 @@ PIP_MIRRORS = [
 ]
 
 
+def _size_mb(path):
+    p = Path(path)
+    if p.is_file():
+        return p.stat().st_size / 1024 / 1024
+    total = 0
+    for dirpath, _, filenames in os.walk(p):
+        for f in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total / 1024 / 1024
+
+
+def _site_packages_dir(venv_dir):
+    sp = Path(venv_dir) / "lib"
+    if get_platform() == "windows":
+        sp = Path(venv_dir) / "Lib"
+    if not sp.exists():
+        return None
+    for ver in sp.iterdir():
+        s = ver / "site-packages"
+        if s.exists():
+            return s
+    return None
+
+
+def _log_site_packages_top(venv_dir, n=15):
+    site = _site_packages_dir(venv_dir)
+    if not site:
+        return
+    sizes = sorted(((_size_mb(c), c.name) for c in site.iterdir()), reverse=True)
+    log(f"  site-packages 体积 top{n}:")
+    for mb, name in sizes[:n]:
+        log(f"    {mb:8.1f} MB  {name}")
+
+
+def _remove_pkg_tests(venv_dir):
+    """删除 site-packages 内各包自带的 tests/testing 目录，运行时不需要。"""
+    removed = 0
+    for dirpath, dirnames, _ in os.walk(venv_dir, topdown=True):
+        keep = []
+        for d in dirnames:
+            if d in ("tests", "testing"):
+                shutil.rmtree(os.path.join(dirpath, d), ignore_errors=True)
+                removed += 1
+            else:
+                keep.append(d)
+        dirnames[:] = keep
+    log(f"==> 已移除 {removed} 个 tests/testing 目录")
+
+
+def _strip_so_binaries(venv_dir):
+    """strip 掉 .so 的调试符号。release wheel 常带大量调试段，去除后运行时无影响。"""
+    strip = shutil.which("strip")
+    if not strip:
+        log("警告: 未找到 strip，跳过符号裁剪")
+        return
+    files = []
+    for dirpath, _, filenames in os.walk(venv_dir):
+        for f in filenames:
+            if f.endswith(".so") or ".so." in f:
+                files.append(os.path.join(dirpath, f))
+    for i in range(0, len(files), 200):
+        subprocess.run([strip, "--strip-unneeded", *files[i:i + 200]],
+                       check=False, capture_output=True)
+    log(f"==> 已 strip {len(files)} 个 .so 文件的调试符号")
+
+
 def build_venv(force=False):
     plat = get_platform()
     if plat == "windows":
@@ -344,11 +438,14 @@ def build_venv(force=False):
         log("错误: Python 依赖安装失败，无法全量打包")
         sys.exit(1)
 
-    # 安全清理：仅删除纯缓存/元数据（字节码缓存、dist-info 等），
-    # 不触碰 .so/.pyd 二进制与包本体，运行时自动重建，对功能无任何影响，
-    # 可让 venv 体积减小 10%~20%。
-    log("==> 清理 venv 中的缓存与元数据（安全，不影响运行）...")
+    log(f"==> venv 原始体积: {_size_mb(venv_dir):.1f} MB")
+    _log_site_packages_top(venv_dir)
+
+    log("==> 清理 venv：tests/testing 目录、strip 调试符号、缓存/元数据 ...")
+    _remove_pkg_tests(venv_dir)
+    _strip_so_binaries(venv_dir)
     _trim_venv(venv_dir)
+    log(f"==> venv 清理后体积: {_size_mb(venv_dir):.1f} MB")
 
     marker.write_text("ok", encoding="utf-8")
     log("venv 打包完成")
@@ -430,6 +527,44 @@ def ensure_fnpack(force=False):
 
 
 # ---------------------------------------------------------------------------
+# sites 二进制按架构过滤
+# ---------------------------------------------------------------------------
+# fpk 分架构构建（CI matrix amd64/arm64），资源包只需保留对应的一个变体
+SITES_ABI = {"amd64": "x86_64", "arm64": "aarch64"}
+
+
+def _filter_sites_binaries(pkg_mp_dir):
+    """按目标架构过滤 MoviePilot-Resources 的 sites 编译产物。
+
+    资源包内置 python311-314 × linux-amd64/aarch64/darwin + win 的全部变体
+    （约 31M），而 NAS 运行时固定为 manifest install_dep_apps 指定的 Python
+    版本、fpk 本就分架构构建，只需保留匹配的一个 .so，可减原始体积约 28M。
+    只操作打包副本（pkg），.local-build/mp 缓存保持完整；资源包命名变更时
+    跳过过滤并告警，宁可包大也不打出缺模块的坏包。
+    """
+    helper = Path(pkg_mp_dir) / "app" / "helper"
+    if not helper.is_dir():
+        return
+    abi = SITES_ABI.get(get_platform_arch())
+    keep_name = f"sites.cpython-{get_runtime_pyver()}-{abi}-linux-gnu.so" if abi else ""
+    if not keep_name or not (helper / keep_name).exists():
+        log(f"警告: 未找到目标 sites 变体（{keep_name or '未知架构'}），跳过过滤")
+        return
+    removed = 0
+    removed_mb = 0.0
+    for f in sorted(helper.iterdir()):
+        # 保留目标变体、.resource-compat 与 user.sites.*.bin 数据文件
+        if f.name == keep_name or f.name == ".resource-compat" \
+                or f.name.startswith("user.sites."):
+            continue
+        if f.name.startswith("sites."):
+            removed_mb += _size_mb(f)
+            f.unlink()
+            removed += 1
+    log(f"==> sites 过滤: 保留 {keep_name}，移除 {removed} 个变体（{removed_mb:.1f} MB）")
+
+
+# ---------------------------------------------------------------------------
 # 组装打包目录（参照 fnos-transmission）
 # 在 .local-build/pkg/ 下组装干净的应用目录树，只含该进包的内容。
 # 打包目录结构需与 manifest 约定一致：
@@ -463,6 +598,7 @@ def prepare_pkg(include_venv):
             shutil.copytree(src_dir, pkg_app / sub, dirs_exist_ok=True)
         else:
             log(f"警告: 缺少构建产物 app/{sub}，打包可能不完整")
+    _filter_sites_binaries(pkg_app / "mp")
 
     if include_venv and VENV_DIR.exists():
         shutil.copytree(VENV_DIR, pkg_app / "venv", dirs_exist_ok=True)
@@ -490,7 +626,7 @@ def build_fpk(fnpack_bin, include_venv):
         version = get_app_version()
         out = PROJECT_DIR / f"moviepilot-{version}.fpk"
         shutil.move(str(fpk), str(out))
-        log(f"构建成功: {out}")
+        log(f"构建成功: {out} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
     else:
         log("未找到构建产物 moviepilot.fpk")
         sys.exit(1)

@@ -5,7 +5,10 @@ set -u
 APP_NAME="moviepilot"
 CONFIG_DIR="${TRIM_PKGVAR}/config"
 MP_SRC="${TRIM_APPDEST}/mp"
-DATA_SHARE="${TRIM_DATA_SHARE_PATHS%%:*}"
+# set -u 兜底：共享路径未导出时退回包数据目录（同为持久目录）
+SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
+DATA_SHARE="${SHARE_PATHS%%:*}"
+[ -n "${DATA_SHARE}" ] || DATA_SHARE="${TRIM_PKGVAR}"
 BACKUP_DIR="${DATA_SHARE}/.moviepilot_backup"
 
 PYTHON_BIN="/var/apps/python312/target/bin/python3"
@@ -58,14 +61,26 @@ if [ "${NEED_INSTALL}" = "1" ]; then
         "https://pypi.tuna.tsinghua.edu.cn/simple/"
         "https://pypi.org/simple/"
     )
+    PIP_OK=0
     for mirror in "${PIP_MIRRORS[@]}"; do
         if "${VENV_DIR}/bin/pip" install -r "${MP_SRC}/requirements.txt" \
                 -i "${mirror}" \
                 --trusted-host "$(echo "${mirror}" | sed -E 's#https?://([^/]+)/.*#\1#')" \
                 >> "${TRIM_PKGVAR}/upgrade.log" 2>&1; then
+            PIP_OK=1
             break
         fi
     done
+    # 全部镜像失败必须终止升级：不能标记 .deps_done，否则带着缺依赖的
+    # venv 启动后端只会崩溃循环
+    if [ "${PIP_OK}" != "1" ]; then
+        {
+            echo "升级失败：Python 依赖安装失败（所有镜像源均不可用），最近日志："
+            echo "--------------------------------------------------"
+            tail -n 40 "${TRIM_PKGVAR}/upgrade.log" 2>/dev/null
+        } > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
     touch "${VENV_DIR}/.deps_done"
 fi
 

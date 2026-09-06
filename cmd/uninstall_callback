@@ -6,11 +6,14 @@ set -u
 APP_NAME="moviepilot"
 
 if [ "${wizard_data_action:-keep}" = "delete" ]; then
-    # 删除数据目录（配置、数据库、venv、日志）
-    rm -rf "${TRIM_PKGVAR}/config" "${TRIM_PKGVAR}/venv" "${TRIM_PKGVAR}/${APP_NAME}.log" \
+    # 删除数据目录（配置、数据库、venv、browsers 浏览器缓存、日志）
+    rm -rf "${TRIM_PKGVAR}/config" "${TRIM_PKGVAR}/venv" "${TRIM_PKGVAR}/browsers" \
+           "${TRIM_PKGVAR}/${APP_NAME}.log" \
            "${TRIM_PKGVAR}/install.log" "${TRIM_PKGVAR}/config.log" "${TRIM_PKGVAR}/upgrade.log"
-    # 删除共享目录中的备份
-    DATA_SHARE="${TRIM_DATA_SHARE_PATHS%%:*}"
+    # 删除共享目录中的备份（共享路径未导出时备份位于包数据目录，一并兜底）
+    SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
+    DATA_SHARE="${SHARE_PATHS%%:*}"
+    [ -n "${DATA_SHARE}" ] || DATA_SHARE="${TRIM_PKGVAR}"
     rm -rf "${DATA_SHARE}/.moviepilot_backup"
 fi
 exit 0

@@ -35,5 +35,11 @@ if [ "$CLASSES" -lt 2 ]; then
     echo "超级管理员密码需至少包含字母、数字、特殊字符中的两类（如：MoviePilot@2026）" > "$TRIM_TEMP_LOGFILE"
     exit 1
 fi
+# 仅允许安全字符集：密码会写入 app.env 并被 dotenv 解析、sed 重写，
+# 含 | & # 引号 空格等字符时会被截断或转义，导致设置成功却无法登录
+if printf '%s' "$PW" | grep -qE '[^A-Za-z0-9!@%^*_.:+?-]'; then
+    echo "密码包含不允许的字符（仅限字母、数字及 !@%^*_.:+?）" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
 
 exit 0

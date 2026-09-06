@@ -4,14 +4,20 @@ set -u
 
 APP_NAME="moviepilot"
 CONFIG_DIR="${TRIM_PKGVAR}/config"
-DATA_SHARE="${TRIM_DATA_SHARE_PATHS%%:*}"
+# set -u 兜底：共享路径未导出时退回包数据目录（同为持久目录）
+SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
+DATA_SHARE="${SHARE_PATHS%%:*}"
+[ -n "${DATA_SHARE}" ] || DATA_SHARE="${TRIM_PKGVAR}"
 BACKUP_DIR="${DATA_SHARE}/.moviepilot_backup"
 
 # 停服务（由 fnOS 流程管理，这里确保停止）
 "${TRIM_APPDEST}/cmd/main" stop >/dev/null 2>&1 || true
 
-# 备份配置（含 SQLite 数据库）
+# 备份配置（含 SQLite 数据库）。
+# 先清掉上次升级可能遗留的旧备份：cp -a 遇已存在的目标会嵌套成 backup/config/config，
+# 导致升级后按 backup/config/ 恢复时找不到 app.env。
 if [ -d "${CONFIG_DIR}" ]; then
+    rm -rf "${BACKUP_DIR}"
     mkdir -p "${BACKUP_DIR}"
     cp -a "${CONFIG_DIR}" "${BACKUP_DIR}/config" 2>/dev/null || \
         cp -r "${CONFIG_DIR}" "${BACKUP_DIR}/config"

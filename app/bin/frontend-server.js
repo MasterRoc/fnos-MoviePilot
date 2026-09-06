@@ -171,8 +171,12 @@ function serveStatic(req, res, pathname) {
     res.end();
     return;
   }
+  // 必须带 path.sep 校验前缀：只比到 FRONTEND_DIR 字符串前缀的话，
+  // "../frontend-evil/x" 这类兄弟前缀目录能通过校验造成路径穿越。
+  // FRONTEND_DIR 本身（根路径 "/"）也放行，交给后面的 SPA 回退。
+  const root = path.normalize(FRONTEND_DIR + path.sep);
   let filePath = path.normalize(path.join(FRONTEND_DIR, rel));
-  if (!filePath.startsWith(path.normalize(FRONTEND_DIR))) {
+  if (filePath !== path.normalize(FRONTEND_DIR) && !filePath.startsWith(root)) {
     res.writeHead(403);
     res.end("Forbidden");
     return;

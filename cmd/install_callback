@@ -165,7 +165,10 @@ if [ ! -f "${INIT_SCRIPT}" ]; then
     fail "初始化脚本不存在：${INIT_SCRIPT}"
 fi
 # 同时输出到共享目录错误文件（便于诊断，trim-cli 可读取）
-SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+# set -u 兜底：共享路径未导出时退回包数据目录
+SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
+SHARE_DIR="${SHARE_PATHS%%:*}"
+[ -n "${SHARE_DIR}" ] || SHARE_DIR="${TRIM_PKGVAR}"
 ERR_OUT="${SHARE_DIR}/moviepilot-init-error.log"
 : > "${ERR_OUT}"
 CONFIG_DIR="${CONFIG_DIR}" MP_SRC="${MP_SRC}" LOG_FILE="${TRIM_PKGVAR}/install.log" \

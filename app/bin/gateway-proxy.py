@@ -594,6 +594,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         t = threading.Thread(target=tunnel, args=(client, backend))
         t.daemon = True
         t.start()
+        # 必须阻塞到隧道结束：ThreadingHTTPServer 在 handler 返回后会立即对客户端
+        # socket 执行 shutdown(SHUT_WR)+close，不等待的话 WebSocket 握手成功后
+        # 毫秒级即被框架断开，前端只能无限静默重连。
+        t.join()
 
     do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = do_PATCH = do_OPTIONS = do_request
 
