@@ -60,8 +60,12 @@ rotate_logs() {
             for i in $(seq $((LOG_MAX_FILES - 1)) -1 1); do
                 [ -f "${LOG_FILE}.${i}" ] && mv "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
             done
-            mv "$LOG_FILE" "${LOG_FILE}.1"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Log rotated" > "$LOG_FILE"
+            # copytruncate 语义：绝不能用 mv 轮转。supervisor 及其子进程（前端/代理）
+            # 以 append 模式长期持有本文件的 fd，mv 之后它们仍写原 inode，日志会被
+            # 割裂到 moviepilot.log.1；改为复制后清空，所有写入者继续落在同一 inode。
+            cp -p "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+            : > "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Log rotated" >> "$LOG_FILE"
         fi
     fi
 }
@@ -74,8 +78,10 @@ get_super_pid() {
             return
         fi
     fi
-    # 带 bin/ 路径前缀，避免误匹配其他应用的 supervisor.py
-    pgrep -f "bin/supervisor\.py" 2>/dev/null | head -1
+    # 必须用本应用的绝对路径匹配：只写 "bin/supervisor.py" 会命中其他 fnOS
+    # 应用的同名脚本（它们同样位于 <appdir>/bin/supervisor.py），导致 is_running
+    # 误判为"运行中"（应用永远起不来），stop 时更会误杀别的应用的主进程。
+    pgrep -f "${BIN_DIR}/supervisor\.py" 2>/dev/null | head -1
 }
 
 is_running() {
@@ -134,10 +140,11 @@ stop_app() {
         is_pid_alive "$p" && kill -9 "$p" 2>/dev/null || true
     fi
     # 兜底：清理残留的后端/前端/代理进程
-    # 模式带 bin/、mp/ 路径前缀（后端为绝对路径启动），避免误杀其他应用的同名进程
-    pgrep -f "mp/app/main\.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    pgrep -f "bin/frontend-server\.js" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    pgrep -f "bin/gateway-proxy\.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    # 一律使用本应用的绝对路径（${MP_SRC}/${BIN_DIR}）匹配，避免误杀其他应用的
+    # 同名脚本进程（后端以绝对路径启动，前端/代理脚本路径同样唯一）。
+    pgrep -f "${MP_SRC}/app/main\.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "${BIN_DIR}/frontend-server\.js" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "${BIN_DIR}/gateway-proxy\.py" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     rm -f "$SUPER_PID_FILE" "$GATEWAY_SOCK"
 }
 

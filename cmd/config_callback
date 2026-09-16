@@ -16,14 +16,23 @@ else
     VENV_DIR="${TRIM_PKGVAR}/venv"
 fi
 
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# shellcheck source=lib.sh
+. "${CMD_DIR}/lib.sh" 2>/dev/null || true
+
 mkdir -p "${CONFIG_DIR}"
 
-# 确保 app.env 对运行用户可写（sed -i 会创建临时文件再 rename，文件不可写会失败）。
-# install/upgrade 后文件可能属 root 且权限 644，后端/配置回调可能以非 root 用户执行。
-if [ -f "${ENV_FILE}" ]; then
-    chmod 666 "${ENV_FILE}" 2>/dev/null || true
-fi
-chmod 777 "${CONFIG_DIR}" 2>/dev/null || true
+# 把配置目录与 app.env 归属到应用运行用户：
+#   1) sed -i 会先写临时文件再 rename，文件不可写会失败；
+#   2) app.env 内含明文超级管理员密码与 API_TOKEN，不应全局可读。
+# 这里不递归：目录内的数据库/日志在安装或升级阶段已递归修正过属主。
+mp_secure_config "${CONFIG_DIR}" "${ENV_FILE}" 0 || {
+    # lib.sh 缺失（异常安装）时退回宽松权限，保证后端可写
+    chmod 777 "${CONFIG_DIR}" 2>/dev/null || true
+    if [ -f "${ENV_FILE}" ]; then
+        chmod 666 "${ENV_FILE}" 2>/dev/null || true
+    fi
+}
 
 # 更新端口（如果向导提供）
 if [ -n "${wizard_port:-}" ]; then

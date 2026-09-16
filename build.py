@@ -22,6 +22,14 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
   python build.py --clean        # 构建前清理 .local-build
   python build.py --skip-mp      # 跳过下载后端源码
   python build.py --skip-fe      # 跳过下载前端
+  python build.py --arch arm64   # 显式指定目标架构（用于裁剪 sites 原生变体）
+
+目标架构（--arch）：
+  MoviePilot-Resources 内置 python311-314 × linux-amd64/aarch64/darwin/win 的
+  全部 sites 原生变体（约 31M）。打包时会按目标架构只保留匹配的一个，减体积
+  约 28M。--arch 缺省时取构建机架构；Windows 上缺省则不裁剪（保留全部变体），
+  因为 fnpack 在 Windows 上无法产出与目标 NAS 绑定的包，宁可包大也不打出
+  缺 app.helper.sites 的坏包。
 
 说明：
   本应用为 Python 后端 + 预编译前端，无需交叉编译原生二进制、无需 npm 构建。
@@ -527,13 +535,33 @@ def ensure_fnpack(force=False):
 
 
 # ---------------------------------------------------------------------------
-# sites 二进制按架构过滤
+# 目标架构解析 + sites 二进制按架构过滤
 # ---------------------------------------------------------------------------
 # fpk 分架构构建（CI matrix amd64/arm64），资源包只需保留对应的一个变体
 SITES_ABI = {"amd64": "x86_64", "arm64": "aarch64"}
+# 允许裁剪的编译产物后缀：只删这些，sites.py 之类源码一律保留
+SITES_BIN_SUFFIXES = (".so", ".pyd")
 
 
-def _filter_sites_binaries(pkg_mp_dir):
+def resolve_target_arch(cli_arch=None):
+    """确定 fpk 的目标 CPU 架构，返回 "amd64" / "arm64" / None。
+
+    返回 None 表示"无法安全判定目标架构"，调用方应跳过一切按架构裁剪的逻辑
+    （保留全部变体），宁可包大也不打出缺模块的坏包。
+
+    - 显式 --arch 最优先（在 Linux/macOS 上为另一架构构建时必须显式指定）；
+    - 否则取构建机架构：Linux/macOS 本地构建，架构通常与目标 NAS 一致；
+    - Windows 上返回 None：fnpack 在 Windows 上产出的包并未与目标架构绑定
+      （build.py 也无法交叉编译 Linux venv），构建机架构不能代表目标 NAS。
+    """
+    if cli_arch:
+        return cli_arch
+    if get_platform() == "windows":
+        return None
+    return get_platform_arch()
+
+
+def _filter_sites_binaries(pkg_mp_dir, target_arch=None):
     """按目标架构过滤 MoviePilot-Resources 的 sites 编译产物。
 
     资源包内置 python311-314 × linux-amd64/aarch64/darwin + win 的全部变体
@@ -541,11 +569,16 @@ def _filter_sites_binaries(pkg_mp_dir):
     版本、fpk 本就分架构构建，只需保留匹配的一个 .so，可减原始体积约 28M。
     只操作打包副本（pkg），.local-build/mp 缓存保持完整；资源包命名变更时
     跳过过滤并告警，宁可包大也不打出缺模块的坏包。
+
+    target_arch 为 None（无法判定目标架构）时跳过过滤、保留全部变体。
     """
     helper = Path(pkg_mp_dir) / "app" / "helper"
     if not helper.is_dir():
         return
-    abi = SITES_ABI.get(get_platform_arch())
+    if not target_arch:
+        log("警告: 未指定且无法判定目标架构，跳过 sites 裁剪（保留全部变体，包体较大但兼容）")
+        return
+    abi = SITES_ABI.get(target_arch)
     keep_name = f"sites.cpython-{get_runtime_pyver()}-{abi}-linux-gnu.so" if abi else ""
     if not keep_name or not (helper / keep_name).exists():
         log(f"警告: 未找到目标 sites 变体（{keep_name or '未知架构'}），跳过过滤")
@@ -557,11 +590,13 @@ def _filter_sites_binaries(pkg_mp_dir):
         if f.name == keep_name or f.name == ".resource-compat" \
                 or f.name.startswith("user.sites."):
             continue
-        if f.name.startswith("sites."):
+        # 只删编译产物（.so/.pyd）；sites.py 等纯 Python 源码必须保留
+        if f.name.startswith("sites.") and f.name.endswith(SITES_BIN_SUFFIXES):
             removed_mb += _size_mb(f)
             f.unlink()
             removed += 1
-    log(f"==> sites 过滤: 保留 {keep_name}，移除 {removed} 个变体（{removed_mb:.1f} MB）")
+    log(f"==> sites 过滤: 目标架构 {target_arch}，保留 {keep_name}，"
+        f"移除 {removed} 个变体（{removed_mb:.1f} MB）")
 
 
 # ---------------------------------------------------------------------------
@@ -574,34 +609,38 @@ def _filter_sites_binaries(pkg_mp_dir):
 #     app/
 #       bin/  mp/  frontend/  venv/  ui/
 # ---------------------------------------------------------------------------
-def prepare_pkg(include_venv):
+def prepare_pkg(include_venv, target_arch=None):
     """把仓库源码 + 构建产物组装到 .local-build/pkg/，返回 pkg 目录。"""
     if PKG_DIR.exists():
         shutil.rmtree(PKG_DIR)
     pkg_app = PKG_DIR / "app"
 
+    # 排除字节码缓存：__pycache__/*.pyc 是构建机产物，跨 Python 版本无效，
+    # 还会把 cpython-38 之类的陈旧字节码打进包（运行时由解释器自行重建）。
+    ignore_junk = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+
     # 1. 仓库源码目录（cmd/config/wizard）
     for sub in SRC_DIRS:
         src = PROJECT_DIR / sub
         if src.exists():
-            shutil.copytree(src, PKG_DIR / sub, dirs_exist_ok=True)
+            shutil.copytree(src, PKG_DIR / sub, dirs_exist_ok=True, ignore=ignore_junk)
 
     # 2. 仓库 app 源码（bin/ui）与构建产物（mp/frontend/venv）组装到 pkg/app/
     #    注意：app 源码要复制（保留项目根），构建产物用 copy（保留 .local-build 缓存供复用）
     for sub in SRC_APP_DIRS:
         src = PROJECT_DIR / "app" / sub
         if src.exists():
-            shutil.copytree(src, pkg_app / sub, dirs_exist_ok=True)
+            shutil.copytree(src, pkg_app / sub, dirs_exist_ok=True, ignore=ignore_junk)
 
     for sub, src_dir in [("mp", MP_DIR), ("frontend", FE_DIR)]:
         if src_dir.exists():
-            shutil.copytree(src_dir, pkg_app / sub, dirs_exist_ok=True)
+            shutil.copytree(src_dir, pkg_app / sub, dirs_exist_ok=True, ignore=ignore_junk)
         else:
             log(f"警告: 缺少构建产物 app/{sub}，打包可能不完整")
-    _filter_sites_binaries(pkg_app / "mp")
+    _filter_sites_binaries(pkg_app / "mp", target_arch)
 
     if include_venv and VENV_DIR.exists():
-        shutil.copytree(VENV_DIR, pkg_app / "venv", dirs_exist_ok=True)
+        shutil.copytree(VENV_DIR, pkg_app / "venv", dirs_exist_ok=True, ignore=ignore_junk)
 
     # 3. 顶层文件
     for f in ["manifest", "ICON.PNG", "ICON_256.PNG", "README.md"]:
@@ -613,9 +652,9 @@ def prepare_pkg(include_venv):
     return PKG_DIR
 
 
-def build_fpk(fnpack_bin, include_venv):
+def build_fpk(fnpack_bin, include_venv, target_arch=None):
     """在 .local-build/pkg/ 下调用 fnpack 打包，产物输出到项目根。"""
-    pkg = prepare_pkg(include_venv)
+    pkg = prepare_pkg(include_venv, target_arch)
     log("==> 打包 ...")
     result = subprocess.run([str(fnpack_bin), "build", "."], cwd=str(pkg))
     if result.returncode != 0:
@@ -641,9 +680,27 @@ def main():
     parser.add_argument("--clean", action="store_true", help="构建前清理 .local-build")
     parser.add_argument("--skip-mp", action="store_true", help="跳过下载后端源码")
     parser.add_argument("--skip-fe", action="store_true", help="跳过下载前端")
+    parser.add_argument("--arch", choices=["amd64", "arm64"], default=None,
+                        help="目标 CPU 架构，用于裁剪 sites 原生变体。缺省取构建机架构；"
+                             "Windows 上缺省则不裁剪（保留全部变体以保证兼容）")
     parser.add_argument("--with-venv", action="store_true",
                         help="把 Python 依赖 venv 一起打包进 fpk（安装时完全不联网；仅 Linux/macOS 可用）")
     args = parser.parse_args()
+
+    target_arch = resolve_target_arch(args.arch)
+    if target_arch:
+        log(f"==> 目标架构: {target_arch}（构建机 {get_platform()}/{get_platform_arch()}）")
+    else:
+        log("==> 目标架构: 未显式指定（Windows 本地构建），sites 原生变体将全部保留")
+
+    # 捆绑 venv 时目标架构必须与构建机一致：venv 里的原生扩展（.so/.pyd）是按
+    # 构建机架构安装的，跨架构捆绑会得到一个能装但起不来的包，必须提前拦住。
+    if args.with_venv and target_arch and target_arch != get_platform_arch():
+        log(f"错误: --with-venv 要求目标架构与构建机架构一致，"
+            f"当前目标 {target_arch} / 构建机 {get_platform_arch()}。")
+        log("      请在与目标架构一致的机器（或 CI runner）上构建，"
+            "或去掉 --with-venv（安装时在线安装依赖）。")
+        sys.exit(1)
 
     if args.clean and BUILD_DIR.exists():
         shutil.rmtree(BUILD_DIR)
@@ -658,7 +715,7 @@ def main():
         build_venv(args.force)
 
     fnpack_bin = ensure_fnpack(args.force)
-    build_fpk(fnpack_bin, args.with_venv)
+    build_fpk(fnpack_bin, args.with_venv, target_arch)
 
 
 if __name__ == "__main__":

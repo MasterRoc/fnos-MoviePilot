@@ -27,7 +27,6 @@ import threading
 import gzip
 import zlib
 import select
-import json
 import logging
 from http.client import HTTPConnection
 from collections import OrderedDict
@@ -253,9 +252,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _strip_prefix(self):
+        """剥离网关前缀，保留 query string。
+
+        必须按路径段边界匹配：裸 startswith 会把 /app/moviepilotXYZ 也剥成
+        "XYZ"（无前导斜杠），拼出非法的请求行。
+        """
         path = self.path
-        if path.startswith(GATEWAY_PREFIX):
-            path = path[len(GATEWAY_PREFIX):] or "/"
+        if path == GATEWAY_PREFIX:
+            return "/"
+        if path.startswith(GATEWAY_PREFIX + "/"):
+            return path[len(GATEWAY_PREFIX):]
         return path
 
     def _read_chunked_body(self):
@@ -294,19 +300,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
         return b"".join(chunks)
 
-    def _send_json(self, status, data):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _handle_api(self, path):
-        # MoviePilot 自身的 /api 由后端处理，直接转发，无需代理自定义接口。
-        return False
-
     def _rewrite_html(self, data):
         data = data.replace(b'</head>', _POLYFILL_BYTES + b'</head>', 1)
         data = _RE_HTML_ATTR.sub(rb'\1=\2' + GATEWAY_PREFIX.encode() + rb'/', data)
@@ -329,9 +322,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         path = self._strip_prefix()
-        if path.startswith("/api/"):
-            if self._handle_api(path):
-                return
 
         is_head = self.command == "HEAD"
         port = INITIAL_PORT
@@ -498,6 +488,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             else:
                 conn.close()
 
+    # WS 握手头部：下列头由代理显式构造或按规范不得透传
+    _WS_SKIP_HEADERS = frozenset({
+        "host", "connection", "upgrade", "origin",
+        "sec-websocket-key", "sec-websocket-version",
+        "sec-websocket-protocol", "sec-websocket-extensions",
+        "content-length", "transfer-encoding",
+    })
+
     def _handle_ws(self):
         path = self._strip_prefix()
         port = INITIAL_PORT
@@ -513,6 +511,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         ws_key = self.headers.get("Sec-WebSocket-Key", "")
         ws_ver = self.headers.get("Sec-WebSocket-Version", "13")
         extra = self.headers.get("Sec-WebSocket-Protocol", "")
+
+        # 透传客户端其余头部。早期实现只发握手必需的 4 个头，Cookie/Authorization
+        # 全部丢失，任何需要登录态的 WebSocket 都会被后端拒绝（401/403）。
+        passthrough = []
+        for k, v in self.headers.items():
+            if k.lower() not in self._WS_SKIP_HEADERS:
+                passthrough.append("%s: %s\r\n" % (k, v))
+
         req_line = (
             "GET %s HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
@@ -521,11 +527,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "%s"
             "Sec-WebSocket-Version: %s\r\n"
             "%s"
+            "%s"
             "Origin: http://%s:%d\r\n\r\n"
         ) % (path, TARGET_HOST, port,
              ("Sec-WebSocket-Key: %s\r\n" % ws_key) if ws_key else "",
              ws_ver,
              ("Sec-WebSocket-Protocol: %s\r\n" % extra) if extra else "",
+             "".join(passthrough),
              TARGET_HOST, port)
         try:
             backend.sendall(req_line.encode())
@@ -568,13 +576,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         client = self.connection
         backend.setblocking(True)
         client.setblocking(True)
+        # 两端开启 TCP keepalive：WebSocket 长时间无业务消息是常态，靠应用层超时
+        # 判断存活不可靠，交给内核探测半开连接（60s 空闲 + 20s×3 探测）。
+        for s in (client, backend):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 20)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except (AttributeError, OSError):
+                pass  # 非 Linux 或系统不支持，忽略
 
         def tunnel(a, b):
             try:
                 while True:
+                    # 超时只用于周期性唤醒，不能因"空闲"就关闭连接：WebSocket 静默
+                    # 数分钟是正常状态，早期实现空闲 30s 即 return，会把正常连接
+                    # 反复踢断。真正的断线由 recv 返回空、sendall 抛错或 TCP
+                    # keepalive 判定。
                     r, _, _ = select.select([a, b], [], [], 30)
                     if not r:
-                        return
+                        continue
                     for s in r:
                         data = s.recv(65536)
                         if not data:

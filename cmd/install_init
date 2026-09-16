@@ -1,5 +1,8 @@
 #!/bin/bash
 ### MoviePilot 安装前检查
+### 注意：本脚本在"安装前准备"阶段执行，此时包文件尚未解压，${TRIM_APPDEST}
+###       下还没有 cmd/lib.sh，因此校验逻辑必须内联自包含，不能 source 公共库。
+###       修改规则时请同步 cmd/lib.sh 的 mp_validate_password。
 set -u
 
 PYTHON_BIN="/var/apps/python312/target/bin/python3"

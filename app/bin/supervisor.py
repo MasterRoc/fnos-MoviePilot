@@ -52,14 +52,34 @@ def log(msg):
                 pass
 
 
+_LOG_HANDLES = {}
+
+
+def _log_handle(path):
+    """打开并缓存追加模式的日志句柄。
+
+    该句柄会以 fd 形式复制给子进程使用，父进程必须长期持有它。若每次启动子服务
+    都新开一个句柄且从不关闭，前端/代理进入崩溃重启循环时会持续泄漏 fd，最终
+    supervisor 因 EMFILE 而无法再拉起任何子服务。
+    """
+    handle = _LOG_HANDLES.get(path)
+    if handle is not None and not handle.closed:
+        return handle
+    try:
+        handle = open(path, "a", encoding="utf-8")
+    except Exception:
+        return None
+    _LOG_HANDLES[path] = handle
+    return handle
+
+
 def _out():
-    """子进程 stdout 目标"""
+    """子进程 stdout 目标（复用缓存句柄，避免每次重启泄漏 fd）"""
     for f in (LOG_FILE, SHARE_LOG):
         if f:
-            try:
-                return open(f, "a", encoding="utf-8")
-            except Exception:
-                continue
+            handle = _log_handle(f)
+            if handle is not None:
+                return handle
     return subprocess.DEVNULL
 
 
@@ -331,23 +351,27 @@ def main():
         sys.exit(1)
 
     log(f"主管进程启动: MP_SRC={MP_SRC}, PORT={BACKEND_PORT}/{FRONTEND_PORT}")
-    # 启动前清理所有残留的后端进程，确保同一时刻只有一个后端进程访问 SQLite 数据库，
-    # 避免历史遗留/上次未杀干净的旧后端与新后端并发导致 disk I/O error。
-    _cleanup_stale_backend()
-    # 启动前清理残留的前端进程，避免旧前端仍占用 FRONTEND_PORT(TCP 3005)，
-    # 导致新前端 listen EADDRINUSE 退出并触发重启风暴。
-    _cleanup_stale_frontend()
     svc = Services()
-    svc.ensure_all()
-    log("主管进程就绪")
 
     def _sigterm(signum, frame):
         log("收到 SIGTERM，正在停止...")
         svc.stop_all()
         sys.exit(0)
 
+    # 信号处理必须在任何耗时操作（残留清理、子服务启动）之前注册：否则启动阶段
+    # 收到 SIGTERM 会走默认动作直接退出，既不执行 stop_all()，也来不及收尾，留下
+    # 一批孤儿后端/前端/代理进程（后端还会继续占用 SQLite）。
     signal.signal(signal.SIGTERM, _sigterm)
     signal.signal(signal.SIGINT, _sigterm)
+
+    # 启动前清理所有残留的后端进程，确保同一时刻只有一个后端进程访问 SQLite 数据库，
+    # 避免历史遗留/上次未杀干净的旧后端与新后端并发导致 disk I/O error。
+    _cleanup_stale_backend()
+    # 启动前清理残留的前端进程，避免旧前端仍占用 FRONTEND_PORT(TCP 3005)，
+    # 导致新前端 listen EADDRINUSE 退出并触发重启风暴。
+    _cleanup_stale_frontend()
+    svc.ensure_all()
+    log("主管进程就绪")
 
     while True:
         time.sleep(5)

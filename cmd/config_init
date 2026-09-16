@@ -2,9 +2,21 @@
 ### MoviePilot 配置变更前
 set -u
 
-# 校验管理员密码（如向导要求修改）
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# shellcheck source=lib.sh
+. "${CMD_DIR}/lib.sh" 2>/dev/null || true
+
+# 校验管理员密码（如向导要求修改）。
+# 必须与 install_init 使用同一套规则：config_callback 会用 sed 把密码写回
+# app.env，只校验长度的话，含 & 等字符的密码会破坏写入，表现为"设置成功却无法登录"。
 if [ -n "${wizard_superuser_password:-}" ]; then
-    if [ ${#wizard_superuser_password} -lt 6 ]; then
+    if command -v mp_validate_password >/dev/null 2>&1; then
+        if ! mp_validate_password "${wizard_superuser_password}"; then
+            echo "${PW_ERR}" > "$TRIM_TEMP_LOGFILE"
+            exit 1
+        fi
+    elif [ ${#wizard_superuser_password} -lt 6 ]; then
+        # lib.sh 缺失（异常安装）时的最小兜底：至少保证长度校验
         echo "管理员密码长度不能小于 6 位" > "$TRIM_TEMP_LOGFILE"
         exit 1
     fi

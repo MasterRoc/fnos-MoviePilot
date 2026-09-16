@@ -1,0 +1,12 @@
+# fnOS 生命周期脚本（cmd/*）在 Linux 上由 bash 执行。若 shebang 行尾带 \r，
+# 内核会去找 /bin/bash\r 这个解释器，直接报 "bad interpreter: No such file or
+# directory"，应用装完起不来。Windows 上 core.autocrlf=true 时 checkout 会把
+# LF 转成 CRLF，所以这里强制这些脚本以 LF 入库、以 LF 检出。
+cmd/* text eol=lf
+*.sh  text eol=lf
+
+# 其余文本文件统一以 LF 入库，避免跨平台差异造成的无意义 diff。
+.gitattributes text eol=lf
+*.py   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf

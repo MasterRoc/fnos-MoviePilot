@@ -13,6 +13,12 @@ BACKUP_DIR="${DATA_SHARE}/.moviepilot_backup"
 
 PYTHON_BIN="/var/apps/python312/target/bin/python3"
 
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${TRIM_PKGVAR}/upgrade.log"; }
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# shellcheck source=lib.sh
+. "${CMD_DIR}/lib.sh" 2>/dev/null || true
+
 # venv 解析：优先使用构建时打包进包的 venv，否则用安装时在线创建的
 if [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
     VENV_DIR="${TRIM_APPDEST}/venv"
@@ -28,12 +34,31 @@ if [ -d "${BACKUP_DIR}/config" ] && [ ! -f "${CONFIG_DIR}/app.env" ]; then
     cp -a "${BACKUP_DIR}/config/." "${CONFIG_DIR}/" 2>/dev/null || true
 fi
 
-# 恢复后的 app.env 经 cp -a 保留了原属主/权限，可能导致后端进程（非 root）无写权限。
-# 放宽 app.env 及 config 目录权限到 666 / 777，避免后端 set_key/unset_key 时 PermissionError。
-if [ -f "${CONFIG_DIR}/app.env" ]; then
-    chmod 666 "${CONFIG_DIR}/app.env" 2>/dev/null || true
+# 恢复后的 app.env 经 cp -a 保留了原属主/权限，可能不属于运行用户。
+# 统一交给 mp_secure_config 收敛（递归：安装阶段由 root 创建的数据库文件
+# 同样需要归属运行用户，否则后端写库会失败）。
+mp_secure_config "${CONFIG_DIR}" "${CONFIG_DIR}/app.env" 1 || {
+    # lib.sh 缺失（异常安装）时退回宽松权限，保证后端可写
+    chmod 777 "${CONFIG_DIR}" 2>/dev/null || true
+    if [ -f "${CONFIG_DIR}/app.env" ]; then
+        chmod 666 "${CONFIG_DIR}/app.env" 2>/dev/null || true
+    fi
+}
+
+# venv 不存在时先创建：从"内嵌 venv"的包升级到"在线安装"的包时，VENV_DIR 会
+# 指向从未创建过的 ${TRIM_PKGVAR}/venv，后续直接调用 ${VENV_DIR}/bin/pip 会让
+# 所有镜像源都失败并中断升级。
+if [ ! -x "${VENV_DIR}/bin/python" ]; then
+    log "venv 不存在，创建：${VENV_DIR}"
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}" >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 || {
+        {
+            echo "升级失败：Python 虚拟环境创建失败（${VENV_DIR}）"
+            echo "--------------------------------------------------"
+            tail -n 40 "${TRIM_PKGVAR}/upgrade.log" 2>/dev/null
+        } > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    }
 fi
-chmod 777 "${CONFIG_DIR}" 2>/dev/null || true
 
 # 确保 Python 依赖完整（非打包 venv 时在线补齐）
 # 优化：大多数升级只是改代码、依赖不变。若 venv 依赖已安装且校验通过（秒级 pip check），
@@ -84,11 +109,26 @@ if [ "${NEED_INSTALL}" = "1" ]; then
     touch "${VENV_DIR}/.deps_done"
 fi
 
-# 数据库结构迁移
-if [ -x "${VENV_DIR}/bin/python" ]; then
-    cd "${MP_SRC}" || exit 0
-    CONFIG_DIR="${CONFIG_DIR}" "${VENV_DIR}/bin/python" -c "from app.db.init import init_db, update_db; init_db(); update_db()" \
-        >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 || true
+# 数据库结构迁移（用子 shell 切换 cwd，避免影响后续步骤的工作目录）
+if [ -x "${VENV_DIR}/bin/python" ] && [ -d "${MP_SRC}" ]; then
+    (
+        cd "${MP_SRC}" && \
+        CONFIG_DIR="${CONFIG_DIR}" "${VENV_DIR}/bin/python" \
+            -c "from app.db.init import init_db, update_db; init_db(); update_db()"
+    ) >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 || true
+fi
+
+# venv 属主修正：升级会整包替换应用目录，内嵌 venv 会重新变成 root 属主；
+# 后端需要用它自己的 pip 安装插件依赖（market.py 走 sys.executable 的 pip），
+# 不修正会导致插件安装 PermissionError。
+mp_secure_venv "${VENV_DIR}" || true
+
+# 重启服务使新版本代码生效。幂等：应用未运行时 start，运行中则 restart。
+# 若不重启，新版本要等到用户下次手动启停才生效。
+if [ -x "${TRIM_APPDEST}/cmd/main" ]; then
+    log "重启应用使新版本生效 ..."
+    "${TRIM_APPDEST}/cmd/main" restart >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 \
+        || log "警告: 应用重启失败，请手动启动应用"
 fi
 
 # 清理备份

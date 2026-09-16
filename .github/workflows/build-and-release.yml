@@ -42,9 +42,11 @@ jobs:
       - name: Build .fpk (with bundled venv)
         # --with-venv 会把 Python 依赖 venv 打进包，安装时完全无需联网
         # 在 ubuntu runner 上构建，架构与目标 NAS 一致（arm64/amd64）
+        # --arch 显式声明目标架构，据此裁剪 sites 原生变体（只保留匹配的那一个）；
+        # 不传会退化为按 runner 架构推断，交叉场景下可能保留错变体。
         # build.py 自动在 .local-build/pkg 组装干净目录树再打包
         run: |
-          python build.py --with-venv
+          python build.py --with-venv --arch ${{ matrix.arch }}
 
           if [ ! -f "moviepilot-${APP_VERSION}.fpk" ]; then
             echo "ERROR: fnpack did not generate moviepilot-${APP_VERSION}.fpk"

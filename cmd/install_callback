@@ -27,6 +27,10 @@ fi
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${TRIM_PKGVAR}/install.log"; }
 fail() { echo "$1" > "$TRIM_TEMP_LOGFILE"; log "ERROR: $1"; exit 1; }
 
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# shellcheck source=lib.sh
+. "${CMD_DIR}/lib.sh" 2>/dev/null || true
+
 mkdir -p "${CONFIG_DIR}" "${FRONTEND_DIR}"
 
 log "=== MoviePilot 安装初始化开始 ==="
@@ -55,10 +59,10 @@ EOF
 
 log "app.env 已生成：${ENV_FILE}"
 
-# 确保 app.env 对运行后端进程的用户可写（防止后端调用 set_key/unset_key 时
-# 因文件属主/权限问题抛出 PermissionError）。@appdata 由安装流程以 root 创建，
-# 后端可能以非 root 用户运行，这里放宽文件权限到 666。
-chmod 666 "${ENV_FILE}" 2>/dev/null || true
+# app.env 的属主/权限统一在安装末尾收敛（见 mp_secure_config 调用）：
+# 下面这些步骤都以 root 执行，root 可写任意文件，无需提前放宽权限。
+# 安装完成后会把配置目录与 venv 一并归属到应用运行用户，并收紧到 700/600，
+# 既保证后端可写，又不让明文密码对同机其他用户可读。
 
 # 2. 准备 Python 虚拟环境
 if [ "${VENV_BUNDLED}" = "1" ]; then
@@ -188,11 +192,18 @@ if [ "${INIT_RC}" -ne 0 ]; then
 fi
 rm -f "${ERR_OUT}"
 
-# 5. 记录数据目录配置到共享目录（供后续引用）
-cat > "${CONFIG_DIR}/paths.conf" <<EOF
-download=${TRIM_DATA_SHARE_PATHS}
-media=${TRIM_DATA_SHARE_PATHS}
-EOF
+# 5. 归属与权限收敛
+# 安装脚本以 root 执行，app.env、SQLite 数据库、venv 全部是 root 属主，而后端
+# 以专用应用用户运行，必须能：写 app.env（set_key/unset_key）、写数据库、
+# 用 pip 向自身解释器环境安装插件依赖（app/adapters/external/market.py）。
+# 因此这里统一把属主交给运行用户；同时 app.env 含明文超级管理员密码与
+# API_TOKEN，权限从原来的 666/777 收紧为 600/700。
+mp_secure_config "${CONFIG_DIR}" "${ENV_FILE}" 1 || {
+    # lib.sh 缺失（异常安装）时退回宽松权限，保证后端可写
+    chmod 777 "${CONFIG_DIR}" 2>/dev/null || true
+    chmod 666 "${ENV_FILE}" 2>/dev/null || true
+}
+mp_secure_venv "${VENV_DIR}" || true
 
 log "=== MoviePilot 安装初始化完成 ==="
 exit 0

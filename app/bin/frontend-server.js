@@ -48,10 +48,63 @@ const MIME = {
   ".eot": "application/vnd.ms-fontobject",
   ".txt": "text/plain; charset=utf-8",
   ".map": "application/json",
+  ".webmanifest": "application/manifest+json",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
 };
 
 function contentType(p) {
   return MIME[path.extname(p).toLowerCase()] || "application/octet-stream";
+}
+
+// 带这些扩展名的请求必须命中真实文件：找不到就 404。
+// 若像 SPA 路由一样回退 index.html，浏览器会把 HTML 当 JS/CSS 解析并抛
+// "Unexpected token '<'"，升级后残留的旧 hash chunk 会表现为整页白屏且难以定位。
+// 官方 nginx 对 js/css 同样是 try_files $uri =404。
+const ASSET_EXT = new Set([
+  ".js", ".mjs", ".css", ".map", ".json", ".txt", ".webmanifest",
+  ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp",
+  ".woff", ".woff2", ".ttf", ".eot", ".otf", ".mp4", ".webm",
+]);
+
+const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp"]);
+const FONT_EXT = new Set([".woff", ".woff2", ".ttf", ".eot", ".otf"]);
+const SCRIPT_EXT = new Set([".js", ".mjs", ".css", ".map"]);
+
+// 缓存策略对齐官方 docker/nginx.common.conf：
+//   /assets/ 与图片、字体 -> 1 年 immutable（文件名带内容哈希）
+//   js/css/map            -> 30 天
+//   service-worker.js / manifest.webmanifest -> no-cache（否则前端更新后浏览器
+//                            可能继续注册旧版本）
+//   index.html 与 SPA 回退 -> no-store
+function cacheControlFor(pathname) {
+  const p = pathname.toLowerCase();
+  const base = p.slice(p.lastIndexOf("/") + 1);
+  if (base === "service-worker.js" || base === "service.js" ||
+      base === "manifest.webmanifest") {
+    return "no-cache, must-revalidate";
+  }
+  if (p.endsWith(".html") || p === "/") {
+    return "no-cache, no-store, must-revalidate";
+  }
+  const ext = path.extname(p);
+  if (p.startsWith("/assets/")) return "public, max-age=31536000, immutable";
+  if (IMAGE_EXT.has(ext) || FONT_EXT.has(ext)) {
+    return "public, max-age=31536000, immutable";
+  }
+  if (SCRIPT_EXT.has(ext)) return "public, max-age=2592000";
+  return "no-cache";
+}
+
+// 与官方 nginx 的 rewrite ^.+mock-server/?(?<suffix>.*)$ /$suffix break; 对齐：
+// CookieCloud 客户端把服务地址配成含 mock-server 的形式时，只保留其后部分。
+const MOCK_MARKER = "mock-server";
+
+function rewriteMockServer(pathname) {
+  const idx = pathname.indexOf(MOCK_MARKER);
+  // idx === 0 时 nginx 的 `.+` 无法匹配，保持原路径
+  if (idx <= 0) return pathname;
+  return "/" + pathname.slice(idx + MOCK_MARKER.length).replace(/^\/+/, "");
 }
 
 // 幂等方法：连接级失败（多半是复用了被对端静默关闭的 keep-alive 连接）时
@@ -59,6 +112,9 @@ function contentType(p) {
 const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 function proxyRequest(req, res, pathname, retried) {
+  // 与官方 nginx 对齐的 mock-server 路径重写（CookieCloud 客户端场景）
+  pathname = rewriteMockServer(pathname);
+
   // 构造安全的后端转发路径：只对 pathname 编码，避免 ERR_UNESCAPED_CHARACTERS。
   // query string 由浏览器已正确 URL 编码，必须原样透传，绝不能再次 encodeURI——
   // 否则 `server=%E9%A3%9E...` 里的 `%` 会被二次编码成 `%25`，后端解码后得到
@@ -183,34 +239,134 @@ function serveStatic(req, res, pathname) {
   }
 
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    // 静态资源缺失必须 404，不能回退 index.html（见 ASSET_EXT 注释）
+    if (ASSET_EXT.has(path.extname(filePath).toLowerCase())) {
+      res.writeHead(404, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache",
+      });
+      res.end("Not Found");
+      return;
+    }
     // SPA 回退：非文件请求全部返回 index.html
     const indexFile = path.join(FRONTEND_DIR, "index.html");
     if (fs.existsSync(indexFile)) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+      });
       fs.createReadStream(indexFile).pipe(res);
       return;
     }
-    res.writeHead(404);
+    res.writeHead(404, { "Cache-Control": "no-cache" });
     res.end("Not Found");
     return;
   }
 
-  res.writeHead(200, { "Content-Type": contentType(filePath) });
+  res.writeHead(200, {
+    "Content-Type": contentType(filePath),
+    "Cache-Control": cacheControlFor(rel),
+  });
   fs.createReadStream(filePath).pipe(res);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket 升级转发
+// ---------------------------------------------------------------------------
+// Node 的 http.Server 在没有 'upgrade' 监听时，会把带 Upgrade 的请求当作普通
+// 请求处理（走 SPA 回退返回 200 HTML），浏览器握手必然失败。网关代理
+// (gateway-proxy.py) 有完整的 WS 隧道，若这里不转发，整条 WS 链路就是断的。
+// 对应官方 nginx 的 proxy_set_header Upgrade $http_upgrade。
+function isProxyPath(pathname) {
+  return pathname === "/api" || pathname.startsWith("/api/") ||
+    pathname === "/cookiecloud" || pathname.startsWith("/cookiecloud/");
+}
+
+function writeRawResponse(socket, res) {
+  const lines = [`HTTP/1.1 ${res.statusCode} ${res.statusMessage}`];
+  const raw = res.rawHeaders || [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    lines.push(`${raw[i]}: ${raw[i + 1]}`);
+  }
+  socket.write(lines.join("\r\n") + "\r\n\r\n");
+}
+
+function proxyUpgrade(req, socket, head) {
+  const pathname = (req.url || "/").split("?")[0];
+  if (!isProxyPath(pathname)) {
+    socket.destroy();
+    return;
+  }
+
+  // 原样透传客户端头（含 Sec-WebSocket-* 与 Cookie/Authorization），
+  // 仅替换 host；Connection/Upgrade 必须保留，否则后端不会返回 101。
+  const headers = Object.assign({}, req.headers, {
+    host: `${BACKEND_HOST}:${BACKEND_PORT}`,
+  });
+
+  let proxyReq;
+  try {
+    proxyReq = http.request({
+      hostname: BACKEND_HOST,
+      port: BACKEND_PORT,
+      path: req.url || "/",
+      method: req.method || "GET",
+      headers,
+    });
+  } catch (err) {
+    console.error("[moviepilot-frontend] upgrade request error:", err.message);
+    socket.destroy();
+    return;
+  }
+
+  proxyReq.on("upgrade", (pRes, pSocket, pHead) => {
+    writeRawResponse(socket, pRes);
+    // 客户端在握手请求之后立刻发出的字节（罕见）与后端 101 之后带出的字节，
+    // 都要按顺序补给对端，否则会丢帧。
+    if (head && head.length) pSocket.write(head);
+    if (pHead && pHead.length) socket.write(pHead);
+    pSocket.pipe(socket);
+    socket.pipe(pSocket);
+    const cleanup = () => {
+      try { pSocket.destroy(); } catch (e) { /* ignore */ }
+      try { socket.destroy(); } catch (e) { /* ignore */ }
+    };
+    pSocket.on("error", cleanup);
+    socket.on("error", cleanup);
+    pSocket.on("close", cleanup);
+    socket.on("close", cleanup);
+  });
+
+  // 后端拒绝升级（401/404 等）：原样回传状态与头部后关闭
+  proxyReq.on("response", (pRes) => {
+    writeRawResponse(socket, pRes);
+    pRes.pipe(socket);
+  });
+
+  proxyReq.on("error", (err) => {
+    console.error("[moviepilot-frontend] upgrade proxy error:", err.message);
+    try {
+      socket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    } catch (e) { /* ignore */ }
+    socket.destroy();
+  });
+
+  proxyReq.end();
 }
 
 const server = http.createServer((req, res) => {
   const pathname = req.url.split("?")[0];
 
   // API 与 CookieCloud 代理到后端
-  if (pathname === "/api" || pathname.startsWith("/api/") ||
-      pathname === "/cookiecloud" || pathname.startsWith("/cookiecloud/")) {
+  if (isProxyPath(pathname)) {
     proxyRequest(req, res, pathname);
     return;
   }
 
   serveStatic(req, res, pathname);
 });
+
+server.on("upgrade", proxyUpgrade);
 
 server.on("error", (err) => {
   console.error("[moviepilot-frontend] server error:", err.message);
