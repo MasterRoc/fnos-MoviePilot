@@ -234,6 +234,7 @@ const http = require("http"), path = require("path"), fs = require("fs");
 const REPO = path.resolve(__dirname, "..", "..", "..");
 const FRONTEND_PORT = 39082, PROXY_PORT = 39083;
 const INDEX_HTML = "<!doctype html><html><head><title>MoviePilot</title></head><body>ok</body></html>";
+let jsHits = 0;
 
 let fail = 0;
 function t(name, cond, extra) {
@@ -253,6 +254,16 @@ const fe = http.createServer((req, res) => {
   if (req.url.startsWith("/api/")) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ detail: "Not authenticated" }));
+    return;
+  }
+  // 静态缓存对照探针：每次响应都带自增计数，用于判断代理是否命中 LRU。
+  //   cache-probe.js      普通 .js -> 应当进缓存（两次响应一致）
+  //   service-worker.js   稳定文件名 PWA 资源 -> 必须不进缓存（两次响应不同）
+  const p = req.url.split("?")[0];
+  if (p.endsWith("/cache-probe.js") || p.endsWith("/service-worker.js")) {
+    jsHits += 1;
+    res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+    res.end("// hits=" + jsHits);
     return;
   }
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -299,6 +310,17 @@ http.server.ThreadingHTTPServer(("127.0.0.1", ${PROXY_PORT}), H).serve_forever()
     t("前缀常量正确", html.body.includes('var P="/app/moviepilot";'));
     const api = await get(PROXY_PORT, "/app/moviepilot/api/v1/system/message?role=notification");
     t("API 前缀剥离并透传 401（非 502）", api.status === 401, "status=" + api.status);
+    // 静态缓存行为：普通 .js 进 LRU，稳定文件名 PWA 资源必须绕过 LRU。
+    // 不修的话，升级后浏览器会一直用旧 Service Worker 拉旧 chunk —— 表现是
+    // 界面报「服务器返回了无效响应」且"刷新后重试"永远无效。
+    const p1 = await get(PROXY_PORT, "/app/moviepilot/cache-probe.js");
+    const p2 = await get(PROXY_PORT, "/app/moviepilot/cache-probe.js");
+    t("对照：普通 .js 命中 LRU 缓存（两次响应一致）",
+      p1.body === p2.body, p1.body + " vs " + p2.body);
+    const s1 = await get(PROXY_PORT, "/app/moviepilot/service-worker.js");
+    const s2 = await get(PROXY_PORT, "/app/moviepilot/service-worker.js");
+    t("service-worker.js 绕过 LRU（两次响应来自后端）",
+      s1.body !== s2.body, s1.body + " vs " + s2.body);
   } finally {
     proc.kill(); fe.close();
   }

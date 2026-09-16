@@ -51,49 +51,25 @@ mkdir -p "${CONFIG_DIR}" "${FRONTEND_DIR}"
 
 log "=== MoviePilot 安装初始化开始 ==="
 
-# 1. 生成 app.env（环境变量文件，供后端读取）
-API_TOKEN="${wizard_api_token:-}"
-if [ -z "${API_TOKEN}" ] || [ ${#API_TOKEN} -lt 16 ]; then
-    API_TOKEN="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32)"
+# 1. 生成 / 更新 app.env（环境变量文件，供后端读取）
+#
+# 语义（含"覆盖安装绝不重建"的完整原因）见 lib.sh 的 mp_env_bootstrap：
+#   * 全新安装 -> 写整份模板并生成两个密钥
+#   * 已存在   -> 只补缺失键，只有向导显式填写的值才覆盖
+# 这样 fnOS 的"重新安装"不会再清空密钥与用户配置。这段逻辑放在 lib.sh 是为了能被
+# tools/cmd_env_smoke.py 直接覆盖（它出过一次把配置整份清空的线上事故）。
+if command -v mp_env_bootstrap >/dev/null 2>&1; then
+    ENV_STATE="$(mp_env_bootstrap "${ENV_FILE}" "${CONFIG_DIR}")"
+    case "${ENV_STATE}" in
+        fresh) log "app.env 已生成（全新安装）：${ENV_FILE}" ;;
+        kept)  log "检测到已有 app.env（覆盖安装）：保留既有配置与密钥，只补齐缺失项" ;;
+        *)     log "警告：app.env 引导返回异常状态（${ENV_STATE}），继续安装" ;;
+    esac
+else
+    # cmd/lib.sh 是包内固定文件（build.py 必然打进 cmd/）；缺失说明包不完整，
+    # 此时写不出可信的 app.env（尤其写不出密钥），必须明确失败而不是带病安装。
+    fail "缺少 cmd/lib.sh（mp_env_bootstrap 不可用），无法准备配置 ${ENV_FILE}"
 fi
-PORT="${wizard_port:-3002}"
-NGINX_PORT="${wizard_nginx_port:-3005}"
-
-# 生成并固化两个密钥。不写进 app.env 的话，MoviePilot 会回退到
-# `secrets.token_urlsafe(32)` 的随机默认值，**每次启动都变**，导致：
-#   - RESOURCE_SECRET_KEY 变化 -> 解不开 Fernet 加密的站点索引
-#     (user.sites.v3.bin)，站点认证页面选站点显示 "No data available"
-#   - SECRET_KEY 变化 -> 已签发的登录令牌全部作废，每次重启都要重新登录
-# 这里生成一次后写入 app.env 持久化；后续升级/改配置只补齐缺失项，绝不覆盖。
-SECRET_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
-RESOURCE_SECRET_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
-
-cat > "${ENV_FILE}" <<EOF
-# MoviePilot fnOS 环境配置
-CONFIG_DIR=${CONFIG_DIR}
-HOST=127.0.0.1
-PORT=${PORT}
-NGINX_PORT=${NGINX_PORT}
-DB_TYPE=sqlite
-API_TOKEN=${API_TOKEN}
-# 安全密钥：必须持久化，随机默认值会导致站点资源解密失败与登录态失效
-SECRET_KEY=${SECRET_KEY}
-RESOURCE_SECRET_KEY=${RESOURCE_SECRET_KEY}
-SUPERUSER=${wizard_superuser:-admin}
-SUPERUSER_PASSWORD=${wizard_superuser_password}
-# GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时
-GITHUB_PROXY=https://gh-proxy.com/
-# 自动更新：应用每次启动（重启）前检查上游 Release 并就地升级，无需重新构建安装包
-MP_AUTO_UPDATE=1
-# 更新通道：release=仅正式版 / prerelease=含测试版 / off=关闭
-MP_UPDATE_CHANNEL=release
-# 检查间隔（秒）：避免每次重启都去查一次 GitHub
-MP_UPDATE_INTERVAL=21600
-# 是否顺带同步 Python 依赖：新版本引入新依赖时必须开启
-MP_UPDATE_DEPS=1
-EOF
-
-log "app.env 已生成：${ENV_FILE}"
 
 # app.env 的属主/权限统一在安装末尾收敛（见 mp_secure_config 调用）：
 # 下面这些步骤都以 root 执行，root 可写任意文件，无需提前放宽权限。

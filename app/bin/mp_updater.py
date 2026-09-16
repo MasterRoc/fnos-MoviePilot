@@ -17,6 +17,8 @@ MoviePilot fnOS 应用自更新器（重启即升级）
 流程：
   1. 读本地版本（mp/version.py 的 APP_VERSION）与状态文件（冷却/失败计数）
   2. 查 GitHub Release（release=仅正式版 / prerelease=含测试版）
+     四级降级：API（只直连）→ 网页 latest → releases.atom → 分支 version.py
+     见 fetch_latest_release —— 越靠后越"能过镜像"，越靠前信息越权威
   3. 有新版本 → 下载后端 zip，校验结构，解析出 FRONTEND_VERSION
   4. 依赖预检：用新 uv.lock 对比已装环境，必要时 pip 补装（可关闭）
   5. 备份 → 替换（app/config/database/scripts/skills/moviepilot + version.py 等）
@@ -42,12 +44,17 @@ MoviePilot fnOS 应用自更新器（重启即升级）
   MP_UPDATE_CHANNEL   release|prerelease|off（默认 release）
   MP_UPDATE_INTERVAL  检查间隔秒（默认 21600）
   MP_UPDATE_DEPS      1/0      是否同步 Python 依赖（默认 1）
-  GITHUB_PROXY        加速前缀（app.env 里已配，直连失败时使用）
+  GITHUB_PROXY        加速前缀，用于 github.com 系 URL（app.env 里已配）
+  GITHUB_PROXY_MIRRORS 额外加速前缀，逗号分隔（本更新器专用，见 Config.proxies）
+
+注意：加速前缀只作用于 github.com 系 URL（归档下载、网页兜底版本发现）。
+api.github.com 一律直连，不走加速（镜像对它的支持参差不齐）。
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import platform
@@ -77,8 +84,40 @@ API_LIST = "https://api.github.com/repos/{repo}/releases?per_page=10"
 BACKEND_ZIP = "https://github.com/{repo}/archive/refs/tags/{tag}.zip"
 FRONTEND_ZIP = "https://github.com/{repo}/releases/download/{tag}/dist.zip"
 
-# 直连失败时的加速前缀（gh-proxy 只认 github.com 系域名，api 失败就退回直连）
+# 不依赖 api.github.com 的版本发现入口（三级降级的后两级，见 fetch_latest_release）。
+# api.github.com 是**独立的域名**，而加速镜像多半只转发 github.com / raw：
+# 一旦镜像不转发 api，请求会一直挂到 SSL 握手超时（实测 ghfast.top 就是这样）。
+# 改用网页端后，"查得到版本"与"下得动包"落在同一批通道上 —— 能下包就一定查得到版本。
+WEB_LATEST = "https://github.com/{repo}/releases/latest"
+WEB_ATOM = "https://github.com/{repo}/releases.atom"
+
+# 最后一级：分支上的 version.py（raw 文件型 URL）。
+# 价值在于 raw 是**文件**型 URL —— 几乎每个镜像都转发它，而同一个镜像对 releases
+# 网页/订阅源往往直接 403 / 404（实测 gh-proxy.com 就是如此）。也就是说：当所有
+# "页面型"通道都不可用时，这一级仍然能通过加速镜像查到版本。
+# 分支名是上游的内部选择，所以候选多个；main 上是 v1.9.19，会被 TAG_RE 自然滤掉。
+RAW_VERSION = "https://raw.githubusercontent.com/{repo}/{ref}/version.py"
+RAW_REFS = ("v3", "main", "master")
+
+# 加速前缀（顺序即尝试顺序），只作用于 github.com 系 URL
 DEFAULT_PROXIES = ("https://gh-proxy.com/", "https://ghfast.top/")
+
+# 传给 http_json 表示"不加任何加速前缀，只直连"。api.github.com 必须走这个：
+# 镜像对 api 域名的支持参差不齐，不支持时不会快速失败，而是一直挂到 SSL 握手
+# 超时（实测 ghfast.top），白等一个超时周期还把日志刷满。
+DIRECT_ONLY: tuple = ()
+
+UA = "moviepilot-fnos-updater"
+# 版本发现：单次请求超时与整体预算。更新检查挂在应用启动路径上，
+# 全部通道都不可达时宁可放弃检查，也不能把启动拖成几分钟。
+DISCOVERY_TIMEOUT = 10
+# 直连 api.github.com 只有一次机会（没有加速通道可退），给足时间
+API_TIMEOUT = 15
+# 四级通道 × 各 1~3 个前缀，最坏情况要留够 —— 预算太小会把"最后那级能用的通道"
+# 直接饿死（它恰恰是受限网络里最可能成功的一级）
+DISCOVERY_BUDGET = 120
+# 版本发现失败后的重试间隔（秒）：网络抖动不该让应用整整一个检查周期（默认 6h）不再查
+RETRY_AFTER_FAILURE = 900
 
 PIP_MIRRORS = (
     "https://pypi.tuna.tsinghua.edu.cn/simple/",
@@ -208,13 +247,25 @@ class Config:
 
     @property
     def proxies(self) -> tuple:
-        """加速前缀：app.env 的 GITHUB_PROXY 优先，再补内置列表。"""
+        """加速前缀：GITHUB_PROXY → GITHUB_PROXY_MIRRORS → 内置列表，去重保序。
+
+        只用于 github.com 系 URL（归档下载、网页兜底版本发现）；api.github.com
+        直连，不受这里影响（见 DIRECT_ONLY）。
+
+        GITHUB_PROXY 是**单值**且上游 MoviePilot 自己也在用（资源包下载），不能改成
+        列表；GITHUB_PROXY_MIRRORS 是本更新器专用的多值扩展（逗号分隔），
+        内置镜像失效时可以不动代码就换一批。
+        """
         out = []
-        custom = self.get("GITHUB_PROXY", "")
-        if custom and custom.lower() != "none":
-            if not custom.endswith("/"):
-                custom += "/"
-            out.append(custom)
+        raw = [self.get("GITHUB_PROXY", "")] + self.get("GITHUB_PROXY_MIRRORS", "").split(",")
+        for item in raw:
+            p = item.strip()
+            if not p or p.lower() == "none" or not p.startswith(("http://", "https://")):
+                continue
+            if not p.endswith("/"):
+                p += "/"
+            if p not in out:
+                out.append(p)
         for p in DEFAULT_PROXIES:
             if p not in out:
                 out.append(p)
@@ -224,14 +275,18 @@ class Config:
 # ---------------------------------------------------------------------------
 # 版本与状态
 # ---------------------------------------------------------------------------
+def parse_py_value(text: str, key: str) -> str:
+    """从 version.py 之类的文本里读 `KEY = 'value'`。"""
+    m = re.search(rf"^{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", text or "", re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
 def read_py_value(path: Path, key: str) -> str:
-    """从 version.py 之类的文件里读 `KEY = 'value'`。"""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
-    m = re.search(rf"^{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", text, re.MULTILINE)
-    return m.group(1).strip() if m else ""
+    return parse_py_value(text, key)
 
 
 _PRE_RANK = {"": 1, "rc": 0, "beta": -1, "alpha": -2}
@@ -278,17 +333,25 @@ def save_state(cfg: Config, state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 网络（直连 -> 加速）
+# 网络（github.com 系 URL：直连 -> 加速；api.github.com：只直连）
 # ---------------------------------------------------------------------------
 def _candidate_urls(url: str, proxies: tuple) -> list:
     return [url] + [f"{p}{url}" for p in proxies]
 
 
-def http_json(url: str, proxies: tuple, timeout: int = 15):
+def _budget_exhausted(deadline) -> bool:
+    return deadline is not None and time.monotonic() > deadline
+
+
+def http_json(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT, deadline=None):
+    """GET 一个 JSON。proxies 传空元组（DIRECT_ONLY）表示只直连、不加加速前缀。"""
     for u in _candidate_urls(url, proxies):
+        if _budget_exhausted(deadline):
+            log("  版本发现已超出时间预算，停止尝试")
+            return None
         try:
             req = urllib.request.Request(
-                u, headers={"User-Agent": "moviepilot-fnos-updater",
+                u, headers={"User-Agent": UA,
                             "Accept": "application/vnd.github+json"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -297,13 +360,42 @@ def http_json(url: str, proxies: tuple, timeout: int = 15):
     return None
 
 
+def fetch_text(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT,
+               deadline=None, limit: int = 512 * 1024):
+    """取一小段文本（HTML / XML），返回 (最终URL, 文本)；全部通道失败返回 (None, None)。
+
+    只读前 limit 字节：这里要的是页面里的 tag，不是整页内容。
+    同时返回最终 URL —— 通道转发重定向时，URL 本身就带着 /releases/tag/vX.Y.Z，
+    比解析正文更可靠。
+
+    注意不要加 Accept-Encoding：urllib 不会自动解压，带上就得自己解 gzip。
+    """
+    for u in _candidate_urls(url, proxies):
+        if _budget_exhausted(deadline):
+            log("  版本发现已超出时间预算，停止尝试")
+            return None, None
+        try:
+            req = urllib.request.Request(u, headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                final = resp.geturl()
+                text = resp.read(limit).decode("utf-8", errors="replace")
+            if text.strip():
+                return final, text
+            log(f"  响应为空 {u}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  请求失败 {u}: {e}")
+    return None, None
+
+
 def download_file(url: str, dest: Path, proxies: tuple, timeout: int = 60) -> bool:
     """下载到 .part 再原子改名，避免中断留下残缺文件被当成完整包。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
     for u in _candidate_urls(url, proxies):
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "moviepilot-fnos-updater"})
+            req = urllib.request.Request(u, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
@@ -335,28 +427,124 @@ def download_file(url: str, dest: Path, proxies: tuple, timeout: int = 60) -> bo
 # ---------------------------------------------------------------------------
 # 版本发现
 # ---------------------------------------------------------------------------
+# /releases/tag/v3.0.4 这个片段在网页正文、og:url、canonical、atom 里形状一致，
+# 一套正则应付全部来源。
+_TAG_PATH_RE = re.compile(r"/releases/tag/([A-Za-z0-9._\-]+)")
+_OG_URL_RE = re.compile(r"<meta[^>]+property=[\"']og:url[\"'][^>]+content=[\"']([^\"']+)", re.I)
+_CANONICAL_RE = re.compile(r"<link[^>]+rel=[\"']canonical[\"'][^>]+href=[\"']([^\"']+)", re.I)
+_ATOM_ENTRY_RE = re.compile(r"<entry\b.*?</entry>", re.I | re.S)
+_PRE_SUFFIX_RE = re.compile(r"[-.](alpha|beta|rc)", re.I)
+
+
+def is_prerelease(tag: str) -> bool:
+    """v3.1.0-beta2 / v3.1.0.rc1 是预发布，v3.1.0 不是。"""
+    return bool(_PRE_SUFFIX_RE.search(tag or ""))
+
+
+def tag_from_release_page(text: str) -> str:
+    """从 releases 网页里取 tag：先信 og:url / canonical（唯一且必在 <head>），
+    再退化为全文首个匹配。"""
+    for rx in (_OG_URL_RE, _CANONICAL_RE):
+        m = rx.search(text or "")
+        if m:
+            found = _TAG_PATH_RE.search(m.group(1))
+            if found:
+                return found.group(1)
+    m = _TAG_PATH_RE.search(text or "")
+    return m.group(1) if m else ""
+
+
+def parse_atom_releases(xml_text: str) -> list:
+    """解析 releases.atom → [(tag, title, published_at)]，保持订阅源顺序（新 → 旧）。"""
+    out = []
+    for block in _ATOM_ENTRY_RE.findall(xml_text or ""):
+        link = _TAG_PATH_RE.search(block)
+        if not link:
+            continue
+        title = re.search(r"<title>(.*?)</title>", block, re.S)
+        updated = re.search(r"<updated>([^<]+)</updated>", block)
+        out.append((link.group(1),
+                    html.unescape(title.group(1).strip()) if title else "",
+                    updated.group(1).strip() if updated else ""))
+    return out
+
+
+def fetch_raw_version(proxies: tuple, deadline=None):
+    """兜底通道：从分支的 version.py 取 APP_VERSION，取不到返回 (None, None)。
+
+    只读几 KB 文本，不下载任何包；靠 TAG_RE 过滤掉 v1/v2 分支的版本号。
+    """
+    for ref in RAW_REFS:
+        final, text = fetch_text(RAW_VERSION.format(repo=BACKEND_REPO, ref=ref), proxies,
+                                 deadline=deadline, limit=8192)
+        tag = parse_py_value(text or "", "APP_VERSION")
+        if tag and TAG_RE.match(tag):
+            log(f"  版本来源: {ref} 分支的 version.py（{tag}）")
+            return tag, {"tag_name": tag, "name": "", "published_at": None}
+    return None, None
+
+
 def fetch_latest_release(cfg: Config):
     """返回 (tag, meta)；查不到返回 (None, None)。
 
-    release 通道走 /releases/latest（GitHub 自动排除预发布）；
-    prerelease 通道走 /releases 列表取第一个符合 v3.x.y 命名的 tag。
+    按"信息量 / 可靠性"排序依次尝试，任一成功即返回：
+
+      1. GitHub API            元数据最全（name / published_at）；**只直连，不走加速**
+      2. 网页 releases/latest  github.com 域名，GitHub 只把它指向**正式版**
+      3. releases.atom 订阅源  按发布顺序列出 tag（含预发布，按通道过滤）
+      4. 分支 version.py       raw 文件型 URL，镜像普遍转发（见 RAW_VERSION 注释）
+
+    第 1 级用 DIRECT_ONLY：加速镜像对 api.github.com 的支持参差不齐，不支持时
+    会挂到 SSL 握手超时而不是快速报错。第 2~4 级存在的理由见 WEB_LATEST 与
+    RAW_VERSION 的注释：能下包（github.com 系）就一定查得到版本。
+    prerelease 通道没有"latest"语义，只能从列表 / 订阅源 / 分支里挑最新的匹配项。
+    整体受 DISCOVERY_BUDGET 约束。
     """
-    channel = cfg.channel
-    if channel == "prerelease":
-        data = http_json(API_LIST.format(repo=BACKEND_REPO), cfg.proxies)
-        items = data if isinstance(data, list) else []
-        for item in items:
+    proxies = cfg.proxies
+    prerelease = cfg.channel == "prerelease"
+    deadline = time.monotonic() + DISCOVERY_BUDGET
+
+    # 1) API（只直连）
+    if prerelease:
+        data = http_json(API_LIST.format(repo=BACKEND_REPO), DIRECT_ONLY,
+                         timeout=API_TIMEOUT, deadline=deadline)
+        for item in (data if isinstance(data, list) else []):
             tag = str(item.get("tag_name") or "")
             if TAG_RE.match(tag):
                 return tag, item
-        return None, None
-    data = http_json(API_LATEST.format(repo=BACKEND_REPO), cfg.proxies)
-    if not isinstance(data, dict):
-        return None, None
-    tag = str(data.get("tag_name") or "")
-    if not TAG_RE.match(tag):
-        return None, None
-    return tag, data
+    else:
+        data = http_json(API_LATEST.format(repo=BACKEND_REPO), DIRECT_ONLY,
+                         timeout=API_TIMEOUT, deadline=deadline)
+        if isinstance(data, dict):
+            tag = str(data.get("tag_name") or "")
+            if TAG_RE.match(tag):
+                return tag, data
+
+    # 2) 网页 latest（只对正式版通道有意义：它永远不含预发布）
+    if not prerelease:
+        final, text = fetch_text(WEB_LATEST.format(repo=BACKEND_REPO), proxies,
+                                 deadline=deadline)
+        m = _TAG_PATH_RE.search(final or "")
+        tag = m.group(1) if m else tag_from_release_page(text or "")
+        if tag and TAG_RE.match(tag) and not is_prerelease(tag):
+            log(f"  版本来源: 网页 releases/latest（{tag}）")
+            return tag, {"tag_name": tag, "name": "", "published_at": None}
+
+    # 3) atom 订阅源
+    final, text = fetch_text(WEB_ATOM.format(repo=BACKEND_REPO), proxies, deadline=deadline)
+    for tag, title, published in parse_atom_releases(text or ""):
+        if not TAG_RE.match(tag):
+            continue
+        if not prerelease and is_prerelease(tag):
+            continue
+        log(f"  版本来源: 网页 releases.atom（{tag}）")
+        return tag, {"tag_name": tag, "name": title, "published_at": published}
+
+    # 4) 分支 version.py（raw 文件型 URL，镜像普遍转发）
+    tag, meta = fetch_raw_version(proxies, deadline=deadline)
+    if tag and (prerelease or not is_prerelease(tag)):
+        return tag, meta
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -1001,9 +1189,16 @@ def do_update(cfg: Config, args) -> int:
         tag, meta = fetch_latest_release(cfg)
     state["checked_at"] = now
     if not tag:
-        state["last_error"] = "无法获取上游最新版本（网络不可达或通道无匹配版本）"
+        state["last_error"] = "无法获取上游最新版本（API 与网页通道均不可达，或通道内无匹配版本）"
+        # 网络抖动不该让应用整整一个检查周期（默认 6h）都不再查：失败只冷却
+        # RETRY_AFTER_FAILURE。把 checked_at 记在"interval - 重试间隔"之前，
+        # 等价于下次检查提前到 RETRY_AFTER_FAILURE 之后。
+        interval = max(cfg.get_int("MP_UPDATE_INTERVAL", 21600), 0)
+        state["checked_at"] = now - max(interval - RETRY_AFTER_FAILURE, 0)
         save_state(cfg, state)
         log("错误: " + state["last_error"])
+        log("      提示: 内置镜像不可用时，可在 app.env 里用 GITHUB_PROXY_MIRRORS="
+            "https://镜像A/,https://镜像B/ 追加可用加速前缀（逗号分隔）")
         return EXIT_FAILED
 
     log(f"上游最新: {tag}（{meta.get('name') or ''}）")

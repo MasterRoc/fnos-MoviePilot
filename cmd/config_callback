@@ -50,20 +50,13 @@ mp_secure_config "${CONFIG_DIR}" "${ENV_FILE}" 0 || {
 }
 
 # 更新端口（如果向导提供）
+# 统一走 mp_env_upsert（存在则替换/不存在则追加）：值里可能含 / & | . 等字符，
+# 用 sed 逐个手写转义迟早出错（早期密码用 "|" 分隔符，遇到含 & 的密码会写坏配置）。
 if [ -n "${wizard_port:-}" ]; then
-    # 更新或追加 PORT
-    if grep -q '^PORT=' "${ENV_FILE}" 2>/dev/null; then
-        sed -i "s/^PORT=.*/PORT=${wizard_port}/" "${ENV_FILE}"
-    else
-        echo "PORT=${wizard_port}" >> "${ENV_FILE}"
-    fi
+    mp_env_upsert "${ENV_FILE}" "PORT" "${wizard_port}"
 fi
 if [ -n "${wizard_nginx_port:-}" ]; then
-    if grep -q '^NGINX_PORT=' "${ENV_FILE}" 2>/dev/null; then
-        sed -i "s/^NGINX_PORT=.*/NGINX_PORT=${wizard_nginx_port}/" "${ENV_FILE}"
-    else
-        echo "NGINX_PORT=${wizard_nginx_port}" >> "${ENV_FILE}"
-    fi
+    mp_env_upsert "${ENV_FILE}" "NGINX_PORT" "${wizard_nginx_port}"
 fi
 
 # 自更新开关（向导 select：1=开启 / 0=关闭）
@@ -72,11 +65,7 @@ if [ -n "${wizard_auto_update:-}" ]; then
         0|1) MP_AUTO_UPDATE_VALUE="${wizard_auto_update}" ;;
         *)   MP_AUTO_UPDATE_VALUE="1" ;;   # 非预期值一律按开启处理，避免误关
     esac
-    if grep -q '^MP_AUTO_UPDATE=' "${ENV_FILE}" 2>/dev/null; then
-        sed -i "s/^MP_AUTO_UPDATE=.*/MP_AUTO_UPDATE=${MP_AUTO_UPDATE_VALUE}/" "${ENV_FILE}"
-    else
-        echo "MP_AUTO_UPDATE=${MP_AUTO_UPDATE_VALUE}" >> "${ENV_FILE}"
-    fi
+    mp_env_upsert "${ENV_FILE}" "MP_AUTO_UPDATE" "${MP_AUTO_UPDATE_VALUE}"
 fi
 # 补齐其它更新相关默认值（旧版本安装的 app.env 没有这些键）
 mp_env_ensure "${ENV_FILE}" "MP_AUTO_UPDATE" "1"
@@ -92,11 +81,7 @@ mp_env_ensure_secret "${ENV_FILE}" "RESOURCE_SECRET_KEY"
 
 # 更新超级管理员密码（如向导要求修改）
 if [ -n "${wizard_superuser_password:-}" ]; then
-    if grep -q '^SUPERUSER_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then
-        sed -i "s|^SUPERUSER_PASSWORD=.*|SUPERUSER_PASSWORD=${wizard_superuser_password}|" "${ENV_FILE}"
-    else
-        echo "SUPERUSER_PASSWORD=${wizard_superuser_password}" >> "${ENV_FILE}"
-    fi
+    mp_env_upsert "${ENV_FILE}" "SUPERUSER_PASSWORD" "${wizard_superuser_password}"
     # 同步到 MoviePilot 用户库（复用同一个初始化脚本，幂等）
     INIT_SCRIPT="${BIN_DIR}/mp_init_superuser.py"
     if [ -x "${APP_PYTHON}" ] && [ -f "${INIT_SCRIPT}" ]; then

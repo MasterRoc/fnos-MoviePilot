@@ -198,7 +198,8 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 ### 工作流程
 
-1. 读本地版本（`mp/version.py`）→ 查 GitHub Release → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
+1. 读本地版本（`mp/version.py`）→ 查上游最新版本 → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
+   版本发现是**四级降级**：`api.github.com` **直连**（不走加速）→ 网页 `releases/latest` → `releases.atom` → 分支 `version.py`（raw 文件型 URL）。后三级都落在 `github.com` / `raw.githubusercontent.com` 上、可走加速前缀 —— 加速镜像普遍只转发「文件」型 URL（实测 gh-proxy 对 releases 网页直接 403/404，对归档与 raw 正常），所以「下载得动」的通道一定也「查得到版本」
 2. 下载后端 zip → 校验结构（有 `app/`、`version.py` 与 tag 一致）→ 解析出 `FRONTEND_VERSION`
 3. 依赖预检：用新 `uv.lock` 对比已装环境，缺什么补什么（`pip`，走国内镜像）
 4. 备份 → 替换 `app/ config/ database/ scripts/ skills/ moviepilot/` 与 `version.py` 等 → **回填资源包文件**（sites 二进制来自独立仓库，上游 zip 里没有）→ 校验资源在位（缺失直接判更新失败并回滚）
@@ -217,7 +218,11 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 | `MP_UPDATE_CHANNEL` | `release` | `release` 仅正式版 / `prerelease` 含测试版 / `off` 关闭 |
 | `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒），避免每次重启都查 GitHub |
 | `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版本有新增依赖时会**拒绝更新**（避免装出起不来的版本） |
-| `GITHUB_PROXY` | `https://gh-proxy.com/` | 下载加速前缀，直连失败时依次尝试 `gh-proxy` / `ghfast` |
+| `GITHUB_PROXY` | `https://gh-proxy.com/` | 加速前缀，**只作用于 `github.com` 系 URL**（归档下载、网页兜底版本发现）；`api.github.com` 一律直连，不受它影响 |
+| `GITHUB_PROXY_MIRRORS` | 空 | 额外加速前缀，逗号分隔（如 `https://a/,https://b/`）。内置镜像失效时可不动代码换一批 |
+
+> 版本发现失败时不占用整个检查间隔：只冷却 15 分钟就重试（网络抖动不该让自动更新停摆半天）。
+> 四级降级带时间预算（API 直连 15s、单次请求 10s、整体 120s），所以更新检查不会把启动拖成几分钟。
 
 ### 手动操作与回退
 

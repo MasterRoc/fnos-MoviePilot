@@ -133,6 +133,40 @@ mp_env_ensure() {
 }
 
 # ---------------------------------------------------------------------------
+# app.env 键值 upsert（存在则替换，不存在则追加）
+# ---------------------------------------------------------------------------
+# 与 mp_env_ensure 的分工：mp_env_ensure 只补缺失键，用于"新增功能默认值"；
+# mp_env_upsert 会覆盖已有值，用于"向导里显式填写的配置"（端口、管理员账号等）。
+#
+# 为什么不用 sed：待写入的值可能含 / & | * . 等字符 —— 密钥是 base64（含 + / =），
+# 密码/用户名也可能带特殊符号。sed 无论选哪个分隔符都要额外转义，漏一个就会写出
+# 坏配置或截断值。这里改为 awk 重写、值经环境变量传入，完全不经过 sed/正则解析。
+#
+# 为什么用 `cat > 文件` 而不是 mv：保留原 inode 与权限位。app.env 已被收敛为
+# 600/应用用户，直接 mv 覆盖会带回默认 umask 权限。
+#   $1 配置文件   $2 键   $3 值
+mp_env_upsert() {
+    local env_file="$1" key="$2" value="$3"
+    [ -n "${env_file}" ] || return 0
+    [ -n "${key}" ] || return 0
+    [ -f "${env_file}" ] || return 0
+    if grep -q "^${key}=" "${env_file}" 2>/dev/null; then
+        MP_UPSERT_KEY="${key}" MP_UPSERT_VALUE="${value}" \
+            awk 'BEGIN { k = ENVIRON["MP_UPSERT_KEY"]; v = ENVIRON["MP_UPSERT_VALUE"] }
+                 index($0, k "=") == 1 { print k "=" v; next }
+                 { print }' "${env_file}" > "${env_file}.tmp" 2>/dev/null || {
+            rm -f "${env_file}.tmp"
+            return 0
+        }
+        cat "${env_file}.tmp" > "${env_file}" 2>/dev/null || true
+        rm -f "${env_file}.tmp"
+    else
+        printf '%s=%s\n' "${key}" "${value}" >> "${env_file}" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 密钥补齐（生成一次后永久稳定）
 # ---------------------------------------------------------------------------
 # 为什么必须显式补：
@@ -164,6 +198,105 @@ mp_env_ensure_secret() {
     secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
     [ -n "${secret}" ] || return 0
     echo "${key}=${secret}" >> "${env_file}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# app.env 引导（全新安装 / 覆盖安装共用）
+# ---------------------------------------------------------------------------
+# 为什么这里必须区分"文件是否已存在"：
+#   app.env 不只是部署参数，它同时是 MoviePilot 自己的配置落点（后端通过 dotenv
+#   的 set_key 把用户设置写回这里：媒体服务器、目录、站点、通知渠道、分类策略…），
+#   并承载两个密钥。无条件重建它 = 清空密钥 + 清空用户配置，实测后果：
+#     - RESOURCE_SECRET_KEY 变化 -> Fernet 站点索引 user.sites.v3.bin 解不开
+#       （站点页/站点认证无数据），且只认资源 Cookie 的 EventSource 接口
+#       （system/message、system/logging）持续 401；
+#     - SECRET_KEY 变化 -> 已签发登录令牌全部作废，前端收到 401 直接登出，
+#       表现为"能登录但各页面列表为空"。
+#   fnOS 的"重新安装"同样会走 install_callback，所以覆盖安装路径绝不能重建。
+# 语义：
+#   * 文件不存在（全新安装） -> 写整份模板，并生成两个密钥
+#   * 文件已存在（覆盖安装） -> 只补齐缺失键；只有"向导里显式填写"的值才覆盖
+# 向导显式值经环境变量读取（wizard_port / wizard_nginx_port / wizard_superuser /
+# wizard_superuser_password / wizard_api_token），与 install_init 使用的键一致。
+# stdout 输出 "fresh" / "kept"，供调用方记录日志。
+#   $1 app.env 路径   $2 CONFIG_DIR
+mp_env_bootstrap() {
+    local env_file="$1" config_dir="$2"
+    [ -n "${env_file}" ] || return 1
+
+    local api_token port nginx_port
+    api_token="${wizard_api_token:-}"
+    if [ -z "${api_token}" ] || [ ${#api_token} -lt 16 ]; then
+        api_token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32)"
+    fi
+    port="${wizard_port:-3002}"
+    nginx_port="${wizard_nginx_port:-3005}"
+
+    if [ -f "${env_file}" ]; then
+        # 覆盖安装：保留既有配置与密钥，只补缺失项
+        mp_env_ensure_secret "${env_file}" "SECRET_KEY"
+        mp_env_ensure_secret "${env_file}" "RESOURCE_SECRET_KEY"
+        mp_env_ensure "${env_file}" "CONFIG_DIR" "${config_dir}"
+        mp_env_ensure "${env_file}" "HOST" "127.0.0.1"
+        mp_env_ensure "${env_file}" "PORT" "${port}"
+        mp_env_ensure "${env_file}" "NGINX_PORT" "${nginx_port}"
+        mp_env_ensure "${env_file}" "DB_TYPE" "sqlite"
+        mp_env_ensure "${env_file}" "API_TOKEN" "${api_token}"
+        mp_env_ensure "${env_file}" "GITHUB_PROXY" "https://gh-proxy.com/"
+        mp_env_ensure "${env_file}" "MP_AUTO_UPDATE" "1"
+        mp_env_ensure "${env_file}" "MP_UPDATE_CHANNEL" "release"
+        mp_env_ensure "${env_file}" "MP_UPDATE_INTERVAL" "21600"
+        mp_env_ensure "${env_file}" "MP_UPDATE_DEPS" "1"
+        # 只有向导里真的填了才覆盖：留空表示"沿用原有配置"，
+        # 早期实现会把留空的管理员密码直接写成空值（等于清掉配置）。
+        if [ -n "${wizard_port:-}" ]; then
+            mp_env_upsert "${env_file}" "PORT" "${wizard_port}"
+        fi
+        if [ -n "${wizard_nginx_port:-}" ]; then
+            mp_env_upsert "${env_file}" "NGINX_PORT" "${wizard_nginx_port}"
+        fi
+        if [ -n "${wizard_superuser:-}" ]; then
+            mp_env_upsert "${env_file}" "SUPERUSER" "${wizard_superuser}"
+        fi
+        if [ -n "${wizard_superuser_password:-}" ]; then
+            mp_env_upsert "${env_file}" "SUPERUSER_PASSWORD" "${wizard_superuser_password}"
+        fi
+        if [ -n "${wizard_api_token:-}" ] && [ ${#wizard_api_token} -ge 16 ]; then
+            mp_env_upsert "${env_file}" "API_TOKEN" "${wizard_api_token}"
+        fi
+        echo "kept"
+        return 0
+    fi
+
+    local secret resource_secret
+    secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+    resource_secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+    cat > "${env_file}" <<EOF
+# MoviePilot fnOS 环境配置
+CONFIG_DIR=${config_dir}
+HOST=127.0.0.1
+PORT=${port}
+NGINX_PORT=${nginx_port}
+DB_TYPE=sqlite
+API_TOKEN=${api_token}
+# 安全密钥：必须持久化，随机默认值会导致站点资源解密失败与登录态失效
+SECRET_KEY=${secret}
+RESOURCE_SECRET_KEY=${resource_secret}
+SUPERUSER=${wizard_superuser:-admin}
+SUPERUSER_PASSWORD=${wizard_superuser_password:-}
+# GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时
+GITHUB_PROXY=https://gh-proxy.com/
+# 自动更新：应用每次启动（重启）前检查上游 Release 并就地升级，无需重新构建安装包
+MP_AUTO_UPDATE=1
+# 更新通道：release=仅正式版 / prerelease=含测试版 / off=关闭
+MP_UPDATE_CHANNEL=release
+# 检查间隔（秒）：避免每次重启都去查一次 GitHub
+MP_UPDATE_INTERVAL=21600
+# 是否顺带同步 Python 依赖：新版本引入新依赖时必须开启
+MP_UPDATE_DEPS=1
+EOF
+    echo "fresh"
     return 0
 }
 

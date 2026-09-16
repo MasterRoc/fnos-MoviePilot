@@ -42,6 +42,17 @@ STATIC_EXTENSIONS = frozenset({
     'ttf', 'eot', 'webp', 'mp4', 'webm',
 })
 
+# 稳定文件名的 PWA 资源绝不能进 LRU 缓存。
+# Service Worker 会按自身 precache 清单继续拉取**旧 chunk**，浏览器刷新也拿不到
+# 新前端：表现为升级后界面报「服务器返回了无效响应」/各页面数据加载失败，且
+# "刷新后重试"永远无效（旧 SW 一直顶在前面）。上游 nginx 对它们是
+# `Cache-Control: no-cache, must-revalidate`（前端服务这一层也已对齐），
+# 而本代理的 LRU 完全不看 Cache-Control，且文件名不带内容哈希 ——
+# 一旦命中就直到代理重启都不会失效。
+_NO_CACHE_BASENAMES = frozenset({
+    'service-worker.js', 'service.js', 'manifest.webmanifest', 'index.html',
+})
+
 # 懒加载 queue 模块（保持启动快）
 _queue = None
 def _get_queue():
@@ -375,8 +386,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     body = None
 
         # 静态缓存命中
+        # 后缀判定沿用原语义（含 query，保守）；额外排除稳定文件名的 PWA 资源，
+        # 否则升级后浏览器会一直用旧 Service Worker 拉旧 chunk（见 _NO_CACHE_BASENAMES）。
         cache_key = self.command + ":" + path
-        cacheable = self.command == "GET" and path.rfind('.') > 0 and \
+        base_name = path.split("?", 1)[0].rsplit("/", 1)[-1].lower()
+        cacheable = self.command == "GET" and base_name not in _NO_CACHE_BASENAMES \
+            and path.rfind('.') > 0 and \
             path[path.rfind('.') + 1:].lower() in STATIC_EXTENSIONS
         if cacheable:
             cached = _static_cache.get(cache_key)

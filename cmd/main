@@ -237,6 +237,16 @@ rotate_logs
 case "${1:-}" in
 start)
     log "=== start ==="
+    # 密钥兜底：app.env 是 SECRET_KEY / RESOURCE_SECRET_KEY 的唯一来源，缺了后端会
+    # 退化成"每次启动随机生成"，后果是登录态与站点索引（以及只认资源 Cookie 的
+    # EventSource 接口）全部作废。install / upgrade / config 三条路径都会补，但
+    # "覆盖安装换上旧模板 / 从旧备份恢复 / 手工改坏"等场景仍可能缺失，这里在启动前
+    # 统一兜一次。幂等：只补缺失键，已有值绝不覆盖（轮换密钥会让旧签名与已加密的
+    # 站点索引永久不可用）。
+    if command -v mp_env_ensure_secret >/dev/null 2>&1; then
+        mp_env_ensure_secret "${CONFIG_DIR}/app.env" "SECRET_KEY"
+        mp_env_ensure_secret "${CONFIG_DIR}/app.env" "RESOURCE_SECRET_KEY"
+    fi
     # 重启即升级：只在真正需要时才会下载（有版本才联网），失败不影响启动。
     if [ "${MP_SKIP_UPDATE:-}" != "1" ]; then
         run_updater --auto || true

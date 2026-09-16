@@ -13,6 +13,9 @@
   B 自检失败：验证自动回滚（版本、资源、前端全部还原）与失败计数
   C 上游产物校验：sha256 不符时忽略
   D 纯函数：版本比较、uv.lock 解析、依赖计划
+  E/F 真实网络（可选，不可达时 SKIP）
+  G 命令行参数契约
+  H 版本发现降级链（API / 网页 latest / atom / 分支 version.py）与镜像配置（离线打桩）
 """
 import hashlib
 import json
@@ -20,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -327,6 +331,117 @@ def scenario_g():
     check("G3 cmd/main 用到的开关都在预期集合内", not missing, f"未定义: {missing}")
 
 
+def scenario_h():
+    """H 版本发现降级链：API → 网页 latest → releases.atom，以及镜像配置。
+
+    真实故障（本次修复的起点）：api.github.com 被网络挡住或镜像不转发该域名时，
+    旧实现直接放弃更新；而"下载"走的 github.com 通道其实是通的。这里全部用打桩
+    钉住降级链、通道过滤与失败后的重试冷却，不依赖网络。
+    """
+    print("\n=== 场景 H：版本发现降级链（离线打桩）===")
+    mp, fe, cfgdir = build_sandbox()
+
+    check("H1 预发布后缀被识别", mod.is_prerelease("v3.1.0-beta2")
+          and mod.is_prerelease("v3.1.0.rc1"))
+    check("H2 正式版不误判", not mod.is_prerelease("v3.0.4"))
+
+    latest_html = ('<html><head><meta property="og:url" '
+                   'content="https://github.com/jxxghp/MoviePilot/releases/tag/v3.0.4" />'
+                   "</head><body>...</body></html>")
+    check("H3 从 og:url 取 tag", mod.tag_from_release_page(latest_html) == "v3.0.4")
+    check("H4 canonical 兜底",
+          mod.tag_from_release_page('<link rel="canonical" href='
+                                    '"https://github.com/x/y/releases/tag/v3.0.5">') == "v3.0.5")
+
+    atom = ('<feed>'
+            '<entry><link rel="alternate" href="https://github.com/jxxghp/MoviePilot'
+            '/releases/tag/v3.1.0-beta2"/><title>v3.1.0-beta2</title>'
+            '<updated>2026-09-10T00:00:00Z</updated></entry>'
+            '<entry><link rel="alternate" href="https://github.com/jxxghp/MoviePilot'
+            '/releases/tag/v3.0.4"/><title>v3.0.4</title>'
+            '<updated>2026-09-01T00:00:00Z</updated></entry>'
+            "</feed>")
+    parsed = mod.parse_atom_releases(atom)
+    check("H5 atom 解析保序（新 → 旧）",
+          [t[0] for t in parsed] == ["v3.1.0-beta2", "v3.0.4"], str(parsed))
+    check("H6 atom 带出发布时间", parsed[1][2].startswith("2026-09-01"), str(parsed[1]))
+
+    real_json, real_text, real_fetch = mod.http_json, mod.fetch_text, mod.fetch_latest_release
+    os.environ["MP_UPDATE_CHANNEL"] = "release"
+
+    # API 全挂 -> 网页 latest 兜底
+    mod.http_json = lambda *a, **k: None
+    mod.fetch_text = lambda *a, **k: (
+        "https://github.com/jxxghp/MoviePilot/releases/tag/v3.0.4", latest_html)
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H7 API 失败时网页 latest 兜底", tag == "v3.0.4", f"tag={tag}")
+
+    # API 与网页 latest 都挂 -> atom 兜底；正式版通道必须跳过顶部的预发布
+    mod.fetch_text = lambda url, *a, **k: (None, atom if "atom" in url else "")
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H8 atom 兜底并跳过预发布（正式版通道）", tag == "v3.0.4", f"tag={tag}")
+
+    os.environ["MP_UPDATE_CHANNEL"] = "prerelease"
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H9 prerelease 通道取最新预发布", tag == "v3.1.0-beta2", f"tag={tag}")
+    os.environ["MP_UPDATE_CHANNEL"] = "release"
+
+    # 全部"页面型"通道都挂 -> 分支 version.py 兜底（raw 是文件型 URL，镜像普遍转发）
+    def raw_only(url, *a, **k):
+        if "raw.githubusercontent.com" not in url:
+            return None, ""
+        if "/v3/" in url:
+            return url, "APP_VERSION = 'v3.0.4'\nFRONTEND_VERSION = 'v3.0.4'\n"
+        # main / master 上是 v1 时代的版本号，必须被 TAG_RE 挡掉
+        return url, "APP_VERSION = 'v1.9.19'\n"
+
+    mod.fetch_text = raw_only
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H10 末级 raw 分支兜底", tag == "v3.0.4", f"tag={tag}")
+
+    mod.fetch_text = lambda url, *a, **k: (
+        url if "raw.githubusercontent.com" in url else None,
+        "APP_VERSION = 'v1.9.19'\n" if "raw.githubusercontent.com" in url else "")
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H11 raw v1 分支版本号被过滤", tag is None, f"tag={tag}")
+
+    mod.http_json, mod.fetch_text = real_json, real_text
+
+    # 镜像配置：GITHUB_PROXY_MIRRORS 逗号分隔追加，非法项忽略，与内置项去重
+    os.environ["GITHUB_PROXY"] = "https://gh-proxy.com/"
+    os.environ["GITHUB_PROXY_MIRRORS"] = "https://a.example/ , not-a-url , https://b.example"
+    check("H12 镜像列表去重保序",
+          mod.Config().proxies[:3] == ("https://gh-proxy.com/", "https://a.example/",
+                                       "https://b.example/"),
+          str(mod.Config().proxies))
+    os.environ.pop("GITHUB_PROXY_MIRRORS", None)
+    os.environ.pop("GITHUB_PROXY", None)
+
+    # API 必须只直连：带上加速前缀时，不转发 api 的镜像会挂到 SSL 握手超时而不是
+    # 快速报错，白白拖长启动路径的更新检查（实测 ghfast.top）。
+    seen = []
+    mod.http_json = lambda url, proxies, **k: (seen.append((url, proxies)), None)[1]
+    mod.fetch_text = lambda *a, **k: (None, "")
+    mod.fetch_latest_release(mod.Config())
+    check("H13 API 只走直连（不带加速前缀）",
+          len(seen) == 1 and seen[0][1] == (), str(seen))
+    mod.http_json, mod.fetch_text = real_json, real_text
+
+    # 版本发现失败：只冷却 RETRY_AFTER_FAILURE，不占用整个检查周期
+    mp, fe, cfgdir = build_sandbox()
+    (cfgdir / "temp" / "moviepilot-update" / "install.json").unlink()  # 逼它走联网查版本
+    os.environ["MP_UPDATE_INTERVAL"] = "21600"
+    mod.fetch_latest_release = lambda c: (None, None)
+    rc = mod.do_update(mod.Config(), Namespace(check=False, rollback=False, force=True))
+    state = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
+    remaining = 21600 - (time.time() - float(state.get("checked_at") or 0))
+    check("H14 发现失败返回失败码", rc == mod.EXIT_FAILED, f"rc={rc}")
+    check("H15 失败后仅待 RETRY_AFTER_FAILURE 再查",
+          abs(remaining - mod.RETRY_AFTER_FAILURE) < 10, f"remaining={remaining:.0f}s")
+    mod.fetch_latest_release = real_fetch
+    os.environ.pop("MP_UPDATE_INTERVAL", None)
+
+
 if __name__ == "__main__":
     mod._real_smoke_test = mod.smoke_test
     scenario_a()
@@ -337,5 +452,6 @@ if __name__ == "__main__":
     scenario_e()
     scenario_f()
     scenario_g()
+    scenario_h()
     print("\n" + ("全部通过" if not FAILS else f"失败 {len(FAILS)} 项: {FAILS}"))
     sys.exit(1 if FAILS else 0)
