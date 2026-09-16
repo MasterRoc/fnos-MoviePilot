@@ -558,6 +558,15 @@ def install_deps(python_dir, uv, req_file, no_build=False, python_platform=None)
     _audit_source_builds() 事后审计兜底：纯 Python 的本地构建放行，带 .so 的
     直接终止构建。想恢复"绝不构建"的严格模式可传 no_build=True。
 
+    为什么必须 --no-deps（关键，踩过坑）：
+    uv export 导出的是 uv.lock 的**完整传递闭包**，本不需要再次解析。而 uv pip
+    install 默认会重新解析每个包的依赖，此时项目级的 [tool.uv] 设置
+    （exclude-dependencies / conflicts）已经丢失 —— 实测就是它把 crcmod 又拉了回来：
+    pyproject 明确排除了 oss2 对 crcmod 的依赖（改用 crcmod-plus），但重新解析时
+    uv 又按 oss2 的元数据装上了真正的 crcmod。而 crcmod 是 sdist-only 且带 C 扩展，
+    于是被现场编译成 .so，直接触发 glibc 风险。--no-deps 让安装严格以锁文件为准，
+    既避免了这个问题，也让产物完全可复现。
+
     关于 --system：python-build-standalone 的 install_only 前缀没有 pyvenv.cfg，属于
     "系统式"环境，直觉上似乎必须加 --system。实测（uv 0.12.15）并非如此 —— 只要用
     --python 显式给出解释器，uv 就直接以该解释器自身的前缀为安装目标，日志为
@@ -576,7 +585,8 @@ def install_deps(python_dir, uv, req_file, no_build=False, python_platform=None)
         base.append("--no-build")
     if python_platform:
         base += ["--python-platform", python_platform]
-    base += ["--no-cache", "-r", str(req_file)]
+    # --no-deps 是必须的，不是优化：详见下方 docstring 的"为什么必须 --no-deps"。
+    base += ["--no-deps", "--no-cache", "-r", str(req_file)]
     attempts = [base, base + ["--system"]]
 
     # 隔离环境干扰：若调用方 shell 里带着 VIRTUAL_ENV，uv 可能优先采用它而不是
@@ -721,7 +731,9 @@ def _smoke_test(python_dir):
     if not py.exists() or not os.access(str(py), os.X_OK):
         log(f"警告: 无法执行自带解释器（{py}），跳过依赖自检")
         return
-    code = ("import fastapi, uvicorn, sqlalchemy, pydantic, pydantic_core, orjson;"
+    # anitopy 是 sdist-only 依赖（PyPI 无 wheel），带上它是为了验证"源码构建"
+    # 这条新打通的路径确实产出了可导入的包，而不只是装上了文件。
+    code = ("import fastapi, uvicorn, sqlalchemy, pydantic, pydantic_core, orjson, anitopy;"
             "print('SMOKE_OK')")
     r = subprocess.run([str(py), "-c", code], capture_output=True, text=True)
     if r.returncode != 0 or "SMOKE_OK" not in r.stdout:
