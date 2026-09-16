@@ -57,16 +57,29 @@ mp_secure_config() {
     return 0
 }
 
-# 让 venv 对应用运行用户可写。MoviePilot 会在运行时用 pip 向自身解释器环境安装
-# 插件依赖（app/adapters/external/market.py 用 sys.executable 对应的 pip），
-# venv 若为 root 独占，插件安装会因 PermissionError 失败。
+# 让 Python 运行时对应用运行用户可写。MoviePilot 会在运行时用 pip 向自身解释器
+# 环境安装插件依赖（app/adapters/external/market.py 用 sys.executable 对应的 pip），
+# 运行时目录若为 root 独占，插件安装会因 PermissionError 失败。官方 Dockerfile
+# 也把 venv 整个 chmod 777，是同一个原因。
+#
+# 只精确处理 pip 真正会写入的两处，不做整树 chown -R：
+#   * lib/pythonX.Y/site-packages —— 装包落点
+#   * bin                        —— pip 生成 console script 的落点
+# 自带运行时整树约 300 MB、数万个文件，全树 chown 会让安装/升级明显变慢，而
+# lib/*.so、include/、share/ 这些地方 pip 根本不会碰。
 mp_secure_venv() {
-    local venv_dir="$1" user
-    if [ -z "${venv_dir}" ] || [ ! -d "${venv_dir}" ]; then
+    local rt="$1" user
+    if [ -z "${rt}" ] || [ ! -d "${rt}" ]; then
         return 0
     fi
     if user="$(mp_app_user)"; then
-        chown -R "${user}:${user}" "${venv_dir}" 2>/dev/null || true
+        for sp in "${rt}"/lib/python3.*/site-packages; do
+            [ -d "${sp}" ] && chown -R "${user}:${user}" "${sp}" 2>/dev/null || true
+        done
+        if [ -d "${rt}/Lib/site-packages" ]; then          # 兼容 Windows 布局（理论分支）
+            chown -R "${user}:${user}" "${rt}/Lib/site-packages" 2>/dev/null || true
+        fi
+        [ -d "${rt}/bin" ] && chown -R "${user}:${user}" "${rt}/bin" 2>/dev/null || true
     fi
     return 0
 }
@@ -99,4 +112,70 @@ mp_validate_password() {
         return 1
     fi
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# Python 运行时解析
+# ---------------------------------------------------------------------------
+# 三种运行时，按优先级：
+#   1. ${TRIM_APPDEST}/python —— 构建时打包的自带 CPython 3.14 + 全部依赖。
+#      MoviePilot V3 要求 requires-python >=3.14，而 fnOS 只有 python312，
+#      所以正常安装都走这个。它是可重定位的普通解释器目录（不是 venv，没有
+#      pyvenv.cfg），bin/python、bin/python3、lib/python3.14/site-packages
+#      一应俱全（bin/python 与 bin/python3 都是指向 bin/python3.14 的符号链接），
+#      所以"解释器根目录"和原来的"venv 目录"用法完全一致。
+#   2. ${TRIM_APPDEST}/venv —— 历史版本打包的 venv（升级场景兼容）。
+#   3. ${TRIM_PKGVAR}/venv —— 安装时用 fnOS python312 在线创建的 venv（兜底）。
+# 注意：pip 一律用 "${python}" -m pip 调用，不要直接执行 ${VENV_DIR}/bin/pip。
+#       python-build-standalone 的 bin/pip 用的是 `exec "$(dirname -- "$(realpath
+#       -- "$0")")/python3.14"` 这种相对路径 trampoline（并非构建机绝对路径
+#       shebang，是可重定位的），但它依赖系统存在 realpath；用 -m pip 可以少
+#       依赖一个外部命令，且对 venv 与自带运行时两种布局都成立。
+MP_FNOS_PYTHON="/var/apps/python312/target/bin/python3"
+
+mp_runtime_dir() {
+    if [ -x "${TRIM_APPDEST:-}/python/bin/python3" ]; then
+        echo "${TRIM_APPDEST}/python"
+        return 0
+    fi
+    if [ -x "${TRIM_APPDEST:-}/venv/bin/python" ]; then
+        echo "${TRIM_APPDEST}/venv"
+        return 0
+    fi
+    if [ -x "${TRIM_PKGVAR:-}/venv/bin/python" ]; then
+        echo "${TRIM_PKGVAR}/venv"
+        return 0
+    fi
+    return 1
+}
+
+# 应用主解释器（跑 supervisor 与后端）。找不到返回 1。
+# 优先 bin/python3、退回 bin/python：自带运行时两者都有，venv 里通常只有 python3，
+# 历史打包的 venv 则可能只有 python。两种布局都覆盖。
+mp_app_python() {
+    local rt
+    if rt="$(mp_runtime_dir)"; then
+        if [ -x "${rt}/bin/python3" ]; then
+            echo "${rt}/bin/python3"
+        else
+            echo "${rt}/bin/python"
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# 通用解释器：优先应用运行时，其次 fnOS python312，最后 PATH 里的 python3。
+# 用于跑只依赖标准库的脚本（如 gateway-proxy.py），保证运行时缺失时仍能起代理。
+mp_any_python() {
+    local rt
+    if rt="$(mp_runtime_dir)"; then
+        echo "${rt}/bin/python3"
+        return 0
+    fi
+    if [ -x "${MP_FNOS_PYTHON}" ]; then
+        echo "${MP_FNOS_PYTHON}"
+        return 0
+    fi
+    command -v python3 2>/dev/null
 }

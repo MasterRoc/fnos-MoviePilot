@@ -5,19 +5,40 @@
 set -u
 
 APP_NAME="moviepilot"
-PYTHON_BIN="/var/apps/python312/target/bin/python3"
 export PATH="/var/apps/nodejs_v24/target/bin:${PATH}"
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# shellcheck source=lib.sh
+. "${CMD_DIR}/lib.sh" 2>/dev/null || true
 
 MP_SRC="${TRIM_APPDEST}/mp"
 BIN_DIR="${TRIM_APPDEST}/bin"
 FRONTEND_DIR="${TRIM_APPDEST}/frontend"
 CONFIG_DIR="${TRIM_PKGVAR}/config"
 
-# venv 解析：优先用打包的，否则用安装时创建的
-if [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
-    VENV_DIR="${TRIM_APPDEST}/venv"
+# 运行时解析：优先构建时打包的自带 Python 3.14（app/python），其次历史版本的
+# venv，最后安装时在线创建的 venv。lib.sh 缺失（异常安装）时退回内联判断，
+# 保证本脚本自身仍可用。
+if command -v mp_runtime_dir >/dev/null 2>&1; then
+    VENV_DIR="$(mp_runtime_dir || echo "${TRIM_PKGVAR}/venv")"
+    PYTHON_BIN="$(mp_any_python || echo "/var/apps/python312/target/bin/python3")"
+    APP_PYTHON="$(mp_app_python || echo "${VENV_DIR}/bin/python")"
 else
-    VENV_DIR="${TRIM_PKGVAR}/venv"
+    if [ -x "${TRIM_APPDEST}/python/bin/python3" ]; then
+        VENV_DIR="${TRIM_APPDEST}/python"
+    elif [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
+        VENV_DIR="${TRIM_APPDEST}/venv"
+    else
+        VENV_DIR="${TRIM_PKGVAR}/venv"
+    fi
+    PYTHON_BIN="/var/apps/python312/target/bin/python3"
+    # 自带运行时与 venv 的差异：前者同时有 bin/python3 与 bin/python，后者通常
+    # 只有 bin/python3（python3 -m venv 在部分版本不建 bin/python）。
+    if [ -x "${VENV_DIR}/bin/python3" ]; then
+        APP_PYTHON="${VENV_DIR}/bin/python3"
+    else
+        APP_PYTHON="${VENV_DIR}/bin/python"
+    fi
 fi
 
 SUPERVISOR="${BIN_DIR}/supervisor.py"
@@ -97,8 +118,8 @@ start_app() {
         echo "错误：主管进程脚本不存在" > "$TRIM_TEMP_LOGFILE"
         return 1
     fi
-    if [ ! -x "${VENV_DIR}/bin/python" ]; then
-        echo "错误：Python 虚拟环境不存在，请重新安装应用" > "$TRIM_TEMP_LOGFILE"
+    if [ ! -x "$APP_PYTHON" ]; then
+        echo "错误：Python 运行时不存在（${APP_PYTHON}），请重新安装应用" > "$TRIM_TEMP_LOGFILE"
         return 1
     fi
     rm -f "$GATEWAY_SOCK"
@@ -109,7 +130,7 @@ start_app() {
         BACKEND_PORT="$BACKEND_PORT" FRONTEND_PORT="$FRONTEND_PORT" \
         GATEWAY_SOCK="$GATEWAY_SOCK" LOG_FILE="$LOG_FILE" \
         SHARE_LOG="$SHARE_LOG" PYTHON_BIN="$PYTHON_BIN" \
-        "${VENV_DIR}/bin/python" "$SUPERVISOR" >> "$LOG_FILE" 2>&1 &
+        "$APP_PYTHON" "$SUPERVISOR" >> "$LOG_FILE" 2>&1 &
     echo $! > "$SUPER_PID_FILE"
     disown 2>/dev/null || true
     # 确认主管进程存活

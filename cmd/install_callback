@@ -1,9 +1,9 @@
 #!/bin/bash
 ### MoviePilot 安装后初始化
-### 依赖 fnOS python312 / nodejs_v24 运行时，需 NAS 可访问外网（pip 安装 Python 依赖）
+### 运行时：优先用构建时打包的自带 Python 3.14（app/python，含全部依赖，安装时无需联网）；
+###         缺失时退回 fnOS python312 + nodejs_v24，在线创建 venv 并安装依赖。
 set -u
 
-PYTHON_BIN="/var/apps/python312/target/bin/python3"
 NODE_BIN="/var/apps/nodejs_v24/target/bin"
 export PATH="${NODE_BIN}:${PATH}"
 
@@ -13,23 +13,37 @@ FRONTEND_DIR="${TRIM_APPDEST}/frontend"    # 前端 dist 目录（打包时内�
 BIN_DIR="${TRIM_APPDEST}/bin"              # 辅助脚本目录（打包时内置）
 ENV_FILE="${CONFIG_DIR}/app.env"
 
-# venv 解析：优先使用构建时打包进包的 venv（安装时不联网），否则安装时在线创建
-BUNDLED_VENV="${TRIM_APPDEST}/venv"
-ONLINE_VENV="${TRIM_PKGVAR}/venv"
-if [ -x "${BUNDLED_VENV}/bin/python" ]; then
-    VENV_DIR="${BUNDLED_VENV}"
-    VENV_BUNDLED=1
-else
-    VENV_DIR="${ONLINE_VENV}"
-    VENV_BUNDLED=0
-fi
-
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${TRIM_PKGVAR}/install.log"; }
-fail() { echo "$1" > "$TRIM_TEMP_LOGFILE"; log "ERROR: $1"; exit 1; }
-
 CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 # shellcheck source=lib.sh
 . "${CMD_DIR}/lib.sh" 2>/dev/null || true
+
+PYTHON_BIN="/var/apps/python312/target/bin/python3"   # fnOS 运行时，仅用于兜底建 venv
+
+# 运行时解析（顺序即优先级）：
+#   1. app/python          —— 构建时打包的自带 CPython 3.14 + 全部依赖，安装时完全不联网
+#   2. app/venv            —— 历史版本打包的 venv（升级兼容）
+#   3. ${TRIM_PKGVAR}/venv —— 用 fnOS python312 在线创建（兜底，需 NAS 可访问外网）
+BUNDLED_RUNTIME="${TRIM_APPDEST}/python"
+LEGACY_BUNDLED_VENV="${TRIM_APPDEST}/venv"
+ONLINE_VENV="${TRIM_PKGVAR}/venv"
+RUNTIME_BUNDLED=0
+if [ -x "${BUNDLED_RUNTIME}/bin/python3" ]; then
+    VENV_DIR="${BUNDLED_RUNTIME}"
+    RUNTIME_BUNDLED=1
+elif [ -x "${LEGACY_BUNDLED_VENV}/bin/python" ]; then
+    VENV_DIR="${LEGACY_BUNDLED_VENV}"
+    RUNTIME_BUNDLED=1
+else
+    VENV_DIR="${ONLINE_VENV}"
+fi
+# pip 一律用 "${PYTHON}" -m pip 调用：自带运行时的 bin/pip 是相对路径 trampoline
+# （依赖系统 realpath），用 -m pip 少依赖一个外部命令，且对 venv / 自带运行时
+# 两种布局都成立。
+PYTHON="${VENV_DIR}/bin/python3"
+[ -x "${PYTHON}" ] || PYTHON="${VENV_DIR}/bin/python"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${TRIM_PKGVAR}/install.log"; }
+fail() { echo "$1" > "$TRIM_TEMP_LOGFILE"; log "ERROR: $1"; exit 1; }
 
 mkdir -p "${CONFIG_DIR}" "${FRONTEND_DIR}"
 
@@ -64,14 +78,26 @@ log "app.env 已生成：${ENV_FILE}"
 # 安装完成后会把配置目录与 venv 一并归属到应用运行用户，并收紧到 700/600，
 # 既保证后端可写，又不让明文密码对同机其他用户可读。
 
-# 2. 准备 Python 虚拟环境
-if [ "${VENV_BUNDLED}" = "1" ]; then
-    # 构建时已打包 venv，安装时不联网
-    log "使用构建时打包的 Python 环境（无需联网安装依赖）"
+# 2. 准备 Python 环境
+if [ "${RUNTIME_BUNDLED}" = "1" ]; then
+    # 构建时已打包自带解释器与全部依赖，安装时不联网
+    log "使用构建时打包的自带 Python 运行时（无需联网安装依赖）"
+    # 装完立刻验一遍解释器与关键依赖。宁可让安装明确失败并给出原因，也不要
+    # 留下"安装成功但一启动就崩"的应用（缺 wheel、glibc 过新都会在这暴露）。
+    if ! "${PYTHON}" -V >> "${TRIM_PKGVAR}/install.log" 2>&1; then
+        fail "自带 Python 运行时无法执行（${PYTHON}），安装包可能已损坏，请重新下载安装包"
+    fi
+    if ! "${PYTHON}" -c "import fastapi, uvicorn, sqlalchemy, pydantic" \
+            >> "${TRIM_PKGVAR}/install.log" 2>&1; then
+        fail "自带 Python 运行时缺少核心依赖（fastapi/uvicorn/sqlalchemy/pydantic），安装包不完整"
+    fi
+    log "自带运行时自检通过：$("${PYTHON}" -V 2>&1)"
 else
-    log "创建 Python 虚拟环境 ..."
+    log "创建 Python 虚拟环境（fnOS python312）..."
     "${PYTHON_BIN}" -m venv "${VENV_DIR}" >> "${TRIM_PKGVAR}/install.log" 2>&1 \
         || fail "Python 虚拟环境创建失败"
+    PYTHON="${VENV_DIR}/bin/python3"
+    [ -x "${PYTHON}" ] || PYTHON="${VENV_DIR}/bin/python"
 fi
 
 # 3. 安装 Python 依赖（耗时长，使用国内加速源，自动回退）
@@ -110,10 +136,12 @@ pip_mirror_host() {
 
 pip_install() {
     # $1 = pip 子命令参数，逐个镜像尝试，成功即返回
+    # 必须用 "${PYTHON}" -m pip：自带运行时的 bin/pip 是相对路径 trampoline，
+    # 直接执行会额外依赖系统 realpath；-m pip 对两种布局都成立。
     local args="$1"
     for mirror in "${PIP_MIRRORS[@]}"; do
         log "尝试 pip 镜像源：${mirror}"
-        if "${VENV_DIR}/bin/pip" install ${args} \
+        if "${PYTHON}" -m pip install ${args} \
                 -i "${mirror}" \
                 --trusted-host "$(pip_mirror_host "${mirror}")" \
                 --timeout "${PIP_TIMEOUT}" \
@@ -126,14 +154,15 @@ pip_install() {
     return 1
 }
 
-# 安全清理 venv 缓存/元数据，减小占用（不影响运行，运行时按需自动重建）。
-# 仅删除 __pycache__ 目录、*.pyc / *.pyo 字节码、*.dist-info / *.egg-info 元数据，
-# 绝不触碰 .so/.pyd/.dylib/.dll 二进制及包本体。
+# 清理**在线安装的 venv** 的缓存/元数据，减小占用（运行时按需自动重建）。
+# 只允许对 ONLINE_VENV 执行 —— 绝不能对自带运行时动手：
+#   * 删 .dist-info 会让 importlib.metadata 读不到包版本，依赖自检/版本展示出错；
+#   * 删 __pycache__/*.pyc 会让首次启动被迫重编译上千个模块（langchain 之类）。
 trim_venv_cache() {
     local venv_dir="$1"
     [ -n "${venv_dir}" ] || return 0
     [ -d "${venv_dir}" ] || return 0
-    log "清理 venv 缓存/元数据（__pycache__/*.pyc/*.dist-info）..."
+    log "清理在线 venv 缓存/元数据（__pycache__/*.pyc/*.dist-info）..."
     # 删除所有 __pycache__ 目录（rm -rf 递归删除，无需 -prune）
     find "${venv_dir}" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
     # 删除所有 .pyc / .pyo 字节码
@@ -143,22 +172,30 @@ trim_venv_cache() {
     log "venv 缓存清理完成"
 }
 
-if [ "${VENV_BUNDLED}" = "1" ]; then
-    : # 构建时已打包依赖（build.py 的 _trim_venv 已清理过缓存），跳过在线安装
+if [ "${RUNTIME_BUNDLED}" = "1" ]; then
+    : # 构建时已打包自带解释器与全部依赖，跳过在线安装
 elif [ ! -f "${VENV_DIR}/.deps_done" ]; then
     log "安装 Python 依赖（可能需要数分钟，使用加速源）..."
+    # 依赖清单用构建时从 uv.lock 导出的 requirements.lock.txt：上游 V3 起已不再
+    # 提供 requirements.txt，沿用旧路径必然失败。仅在锁文件缺失时才退回旧路径。
+    REQ_FILE="${MP_SRC}/requirements.lock.txt"
+    if [ ! -f "${REQ_FILE}" ]; then
+        REQ_FILE="${MP_SRC}/requirements.txt"
+        log "警告: 未找到 requirements.lock.txt，退回 requirements.txt（V3 下通常不存在）"
+    fi
+    if [ ! -f "${REQ_FILE}" ]; then
+        fail "未找到依赖清单（requirements.lock.txt / requirements.txt），无法安装依赖"
+    fi
     # 先升级 pip（仅第一个可达镜像，带超时；失败不阻塞主安装）
-    "${VENV_DIR}/bin/pip" install --upgrade pip \
+    "${PYTHON}" -m pip install --upgrade pip \
         -i "${PIP_MIRRORS[0]}" \
         --trusted-host "$(pip_mirror_host "${PIP_MIRRORS[0]}")" \
         --timeout "${PIP_TIMEOUT}" \
         >> "${TRIM_PKGVAR}/install.log" 2>&1 || log "pip 升级失败（可忽略，继续安装依赖）"
-    pip_install "-r ${MP_SRC}/requirements.txt" \
+    pip_install "-r ${REQ_FILE}" \
         || fail "Python 依赖安装失败，请检查网络后重试（详见安装日志）"
     touch "${VENV_DIR}/.deps_done"
-    # 安全清理在线安装的 venv 缓存/元数据（__pycache__/*.pyc/*.dist-info）。
-    # 仅删纯缓存，不碰 .so/.pyd 与包本体，运行时按需自动重建，无功能影响；
-    # 实测可释放在线 venv 约 12%~18% 磁盘（百 MB 级）。
+    # 只清理在线 venv；自带运行时不清理（理由见 trim_venv_cache 注释）
     trim_venv_cache "${VENV_DIR}"
 fi
 
@@ -176,7 +213,7 @@ SHARE_DIR="${SHARE_PATHS%%:*}"
 ERR_OUT="${SHARE_DIR}/moviepilot-init-error.log"
 : > "${ERR_OUT}"
 CONFIG_DIR="${CONFIG_DIR}" MP_SRC="${MP_SRC}" LOG_FILE="${TRIM_PKGVAR}/install.log" \
-    "${VENV_DIR}/bin/python" "${INIT_SCRIPT}" 2>&1 | tee -a "${TRIM_PKGVAR}/install.log" "${ERR_OUT}"
+    "${PYTHON}" "${INIT_SCRIPT}" 2>&1 | tee -a "${TRIM_PKGVAR}/install.log" "${ERR_OUT}"
 INIT_RC=${PIPESTATUS[0]}
 if [ "${INIT_RC}" -ne 0 ]; then
     # 失败：把详细日志写入 TRIM_TEMP_LOGFILE（注意 fail 会覆盖，这里手动写入完整错误后 exit）

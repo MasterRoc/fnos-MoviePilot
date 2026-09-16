@@ -14,7 +14,9 @@ jobs:
   build:
     name: Build MoviePilot - ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # 自带运行时要把 langchain 全家桶 + boto3/google-genai/anthropic/openai 等
+    # 数百 MB 依赖下载并装入 site-packages，比原来的 48 秒构建慢得多，放宽超时。
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -29,9 +31,18 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python
+        # 仅用于驱动 build.py / uv。uv 需能解析 MoviePilot 的 requires-python >= 3.14，
+        # 故 runner 上的解释器不能低于 3.14（真正打进包的是下面下载的 PBS 3.14.7）。
         uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: '3.14'
+
+      - name: Set up uv
+        # 可选加速：build.py 会用 uv 按 uv.lock 装依赖。装了这里就能省掉 pip 安装 uv
+        # 的一步；万一该 action 不可用也不影响构建（build.py 的 _ensure_uv 会自行
+        # 在 .local-build/tools 下 pip 装一个，不污染 runner 环境）。
+        uses: astral-sh/setup-uv@v5
+        continue-on-error: true
 
       - name: Read version from manifest
         run: |
@@ -39,14 +50,21 @@ jobs:
           echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
           echo "APP_VERSION=${APP_VERSION}"
 
-      - name: Build .fpk (with bundled venv)
-        # --with-venv 会把 Python 依赖 venv 打进包，安装时完全无需联网
-        # 在 ubuntu runner 上构建，架构与目标 NAS 一致（arm64/amd64）
-        # --arch 显式声明目标架构，据此裁剪 sites 原生变体（只保留匹配的那一个）；
-        # 不传会退化为按 runner 架构推断，交叉场景下可能保留错变体。
-        # build.py 自动在 .local-build/pkg 组装干净目录树再打包
+      - name: Build .fpk (with bundled Python 3.14 runtime)
+        # --with-runtime 会：
+        #   1. 下载 astral-sh/python-build-standalone 的可重定位 CPython 3.14.7
+        #      （*install_only_stripped*，arm64 约 29 MB / amd64 约 34 MB）
+        #   2. 用 uv 从 MoviePilot 的 uv.lock 导出 runtime-standard 组需求，
+        #      再 --no-build 装进该解释器的 site-packages（只用预编译 wheel）
+        #   3. 把整个解释器目录随包发布 → 真机安装时零联网、零编译
+        # 之所以自带解释器而非 venv：venv 的 bin/python 是指向构建机绝对路径的
+        # 符号链接、pyvenv.cfg 也含构建机路径，搬到 NAS 必然失效。
+        # 之所以不用 fnOS 的 python312：MoviePilot V3 要求 requires-python >= 3.14。
+        # 在 ubuntu runner 上构建，架构与目标 NAS 一致（arm64/amd64）；
+        # --arch 显式声明目标架构，据此裁剪 sites 原生变体（只保留匹配的那一个）。
+        # build.py 自动在 .local-build/pkg 组装干净目录树再打包。
         run: |
-          python build.py --with-venv --arch ${{ matrix.arch }}
+          python build.py --with-runtime --arch ${{ matrix.arch }}
 
           if [ ! -f "moviepilot-${APP_VERSION}.fpk" ]; then
             echo "ERROR: fnpack did not generate moviepilot-${APP_VERSION}.fpk"
@@ -61,6 +79,61 @@ jobs:
           echo "Created package: ${PACKAGE_NAME}"
           ls -lh "${PACKAGE_NAME}"
 
+      - name: Verify bundled runtime inside .fpk
+        # 回归护栏：防止再次出现「CI 全绿但包里没有依赖」的静默失败。
+        # .fpk 是 gzip tar，内含 app.tgz，需要嵌套解开检查。
+        # 校验方式刻意用"实际执行包里的解释器 + importlib.metadata"而不是 ls 通配：
+        # dist-info 目录名大小写与包名并不一致（如 SQLAlchemy），通配极易误判。
+        run: |
+          set -e
+          WORK=$(mktemp -d)
+          tar -xzf "${PACKAGE_NAME}" -C "$WORK"
+          mkdir -p "$WORK/app"
+          tar -xzf "$WORK/app.tgz" -C "$WORK/app"
+
+          PY="$WORK/app/python/bin/python3"
+          if [ ! -x "$PY" ]; then
+            echo "ERROR: bundled interpreter missing: app/python/bin/python3"
+            exit 1
+          fi
+          SITE=$(ls -d "$WORK/app"/python/lib/python3.*/site-packages 2>/dev/null | head -n1)
+          if [ -z "$SITE" ]; then
+            echo "ERROR: bundled site-packages missing"
+            exit 1
+          fi
+          echo "site-packages: $SITE"
+
+          "$PY" - <<'PYEOF'
+          import importlib.metadata as md
+          import sys
+
+          print("interpreter :", sys.version.split()[0], "|", sys.executable)
+
+          # 覆盖纯 Python / Rust 扩展 / C 扩展三类，外加一个精确 pin 的包
+          required = [
+              "fastapi", "uvicorn", "sqlalchemy", "pydantic", "pydantic-core",
+              "orjson", "cryptography", "pillow", "lxml", "psycopg2-binary",
+              "langchain", "boto3",
+          ]
+          missing = []
+          for name in required:
+              try:
+                  md.version(name)
+              except md.PackageNotFoundError:
+                  missing.append(name)
+          if missing:
+              print("ERROR: missing distributions:", ", ".join(missing))
+              sys.exit(1)
+
+          # 真正 import 一遍，确保原生扩展的 .so 能被加载
+          import fastapi, uvicorn, sqlalchemy, pydantic, pydantic_core, orjson  # noqa
+          print("import check: OK")
+          print("distributions:", len(list(md.distributions())))
+          PYEOF
+
+          echo "app/python size : $(du -sh "$WORK/app/python" | cut -f1)"
+          echo "OK: bundled runtime verified"
+
       - name: Create SHA256 checksums
         run: |
           sha256sum "${PACKAGE_NAME}" > "${PACKAGE_NAME}.sha256sum"
@@ -73,7 +146,7 @@ jobs:
           path: |
             ${{ env.PACKAGE_NAME }}
             ${{ env.PACKAGE_NAME }}.sha256sum
-          retention-days: 30
+          retention-days: 7
 
       - name: Build summary
         run: |
@@ -82,7 +155,8 @@ jobs:
 
           **Version:** ${{ env.APP_VERSION }}
           **Architecture:** ${{ matrix.arch }}
-          **Bundled venv:** yes (安装时无需联网)
+          **Bundled runtime:** CPython 3.14.7 (python-build-standalone, 安装时无需联网)
+          **Package size:** $(du -h "${PACKAGE_NAME}" | cut -f1)
 
           **Git Info:**
           - Commit: \`${{ github.sha }}\`

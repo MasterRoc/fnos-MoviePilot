@@ -19,14 +19,25 @@ CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 # shellcheck source=lib.sh
 . "${CMD_DIR}/lib.sh" 2>/dev/null || true
 
-# venv 解析：优先使用构建时打包进包的 venv，否则用安装时在线创建的
-if [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
+# 运行时解析（顺序即优先级）：
+#   1. app/python          —— 构建时打包的自带 CPython 3.14 + 全部依赖
+#   2. app/venv            —— 历史版本打包的 venv（升级兼容）
+#   3. ${TRIM_PKGVAR}/venv —— 用 fnOS python312 在线创建（兜底）
+BUNDLED_RUNTIME="${TRIM_APPDEST}/python"
+RUNTIME_BUNDLED=0
+if [ -x "${BUNDLED_RUNTIME}/bin/python3" ]; then
+    VENV_DIR="${BUNDLED_RUNTIME}"
+    RUNTIME_BUNDLED=1
+elif [ -x "${TRIM_APPDEST}/venv/bin/python" ]; then
     VENV_DIR="${TRIM_APPDEST}/venv"
-    VENV_BUNDLED=1
+    RUNTIME_BUNDLED=1
 else
     VENV_DIR="${TRIM_PKGVAR}/venv"
-    VENV_BUNDLED=0
 fi
+# pip 一律用 "${PYTHON}" -m pip：自带运行时的 bin/pip 是相对路径 trampoline
+# （依赖系统 realpath），用 -m pip 少依赖一个外部命令且两种布局都成立
+PYTHON="${VENV_DIR}/bin/python3"
+[ -x "${PYTHON}" ] || PYTHON="${VENV_DIR}/bin/python"
 
 # 恢复备份的配置（新装时 TRIM_PKGVAR 可能被清空）
 if [ -d "${BACKUP_DIR}/config" ] && [ ! -f "${CONFIG_DIR}/app.env" ]; then
@@ -45,10 +56,11 @@ mp_secure_config "${CONFIG_DIR}" "${CONFIG_DIR}/app.env" 1 || {
     fi
 }
 
-# venv 不存在时先创建：从"内嵌 venv"的包升级到"在线安装"的包时，VENV_DIR 会
-# 指向从未创建过的 ${TRIM_PKGVAR}/venv，后续直接调用 ${VENV_DIR}/bin/pip 会让
-# 所有镜像源都失败并中断升级。
-if [ ! -x "${VENV_DIR}/bin/python" ]; then
+# venv 不存在时先创建：从"内嵌运行时"的包升级到"在线安装"的包时，VENV_DIR 会
+# 指向从未创建过的 ${TRIM_PKGVAR}/venv，后续 pip 调用会让所有镜像源都失败并
+# 中断升级。自带运行时（RUNTIME_BUNDLED=1）自带解释器，无需建 venv。
+if [ "${RUNTIME_BUNDLED}" != "1" ] \
+        && [ ! -x "${VENV_DIR}/bin/python3" ] && [ ! -x "${VENV_DIR}/bin/python" ]; then
     log "venv 不存在，创建：${VENV_DIR}"
     "${PYTHON_BIN}" -m venv "${VENV_DIR}" >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 || {
         {
@@ -58,6 +70,8 @@ if [ ! -x "${VENV_DIR}/bin/python" ]; then
         } > "$TRIM_TEMP_LOGFILE"
         exit 1
     }
+    PYTHON="${VENV_DIR}/bin/python3"
+    [ -x "${PYTHON}" ] || PYTHON="${VENV_DIR}/bin/python"
 fi
 
 # 确保 Python 依赖完整（非打包 venv 时在线补齐）
@@ -65,14 +79,25 @@ fi
 #       直接跳过耗时的 pip install，只做数据库迁移，把升级从"重装全部依赖"缩短到几秒。
 #       仅当依赖确实缺失（pip check 失败）或从未装过时才走完整 pip install。
 NEED_INSTALL=0
-if [ "${VENV_BUNDLED}" = "1" ]; then
+if [ "${RUNTIME_BUNDLED}" = "1" ]; then
     NEED_INSTALL=0
-elif [ ! -x "${VENV_DIR}/bin/pip" ]; then
-    NEED_INSTALL=1
+    # 升级会整包替换应用目录，自带运行时也随之被换成新包里的那份。这里同样做一次
+    # 自检：新包若因缺 wheel / glibc 过新而不可用，必须让升级明确失败，否则会
+    # 留下一个"升级成功但起不来"的应用，且旧版本已被覆盖、无法回退。
+    if ! "${PYTHON}" -c "import fastapi, uvicorn, sqlalchemy, pydantic" \
+            >> "${TRIM_PKGVAR}/upgrade.log" 2>&1; then
+        {
+            echo "升级失败：新版本自带的 Python 运行时缺少核心依赖，已终止升级"
+            echo "--------------------------------------------------"
+            tail -n 40 "${TRIM_PKGVAR}/upgrade.log" 2>/dev/null
+        } > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
+    log "自带运行时自检通过：$("${PYTHON}" -V 2>&1)"
 elif [ ! -f "${VENV_DIR}/.deps_done" ]; then
     NEED_INSTALL=1
 else
-    if "${VENV_DIR}/bin/python" -m pip check >> "${TRIM_PKGVAR}/upgrade.log" 2>&1; then
+    if "${PYTHON}" -m pip check >> "${TRIM_PKGVAR}/upgrade.log" 2>&1; then
         NEED_INSTALL=0
     else
         NEED_INSTALL=1
@@ -80,6 +105,18 @@ else
 fi
 
 if [ "${NEED_INSTALL}" = "1" ]; then
+    # 依赖清单用构建时从 uv.lock 导出的 requirements.lock.txt：
+    # 上游 V3 起已不再提供 requirements.txt，沿用旧路径必然失败。
+    REQ_FILE="${MP_SRC}/requirements.lock.txt"
+    [ -f "${REQ_FILE}" ] || REQ_FILE="${MP_SRC}/requirements.txt"
+    if [ ! -f "${REQ_FILE}" ]; then
+        {
+            echo "升级失败：未找到依赖清单（requirements.lock.txt / requirements.txt）"
+            echo "--------------------------------------------------"
+            tail -n 40 "${TRIM_PKGVAR}/upgrade.log" 2>/dev/null
+        } > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
     PIP_MIRRORS=(
         "https://mirrors.aliyun.com/pypi/simple/"
         "https://mirrors.cloud.tencent.com/pypi/simple/"
@@ -88,7 +125,7 @@ if [ "${NEED_INSTALL}" = "1" ]; then
     )
     PIP_OK=0
     for mirror in "${PIP_MIRRORS[@]}"; do
-        if "${VENV_DIR}/bin/pip" install -r "${MP_SRC}/requirements.txt" \
+        if "${PYTHON}" -m pip install -r "${REQ_FILE}" \
                 -i "${mirror}" \
                 --trusted-host "$(echo "${mirror}" | sed -E 's#https?://([^/]+)/.*#\1#')" \
                 >> "${TRIM_PKGVAR}/upgrade.log" 2>&1; then
@@ -110,10 +147,10 @@ if [ "${NEED_INSTALL}" = "1" ]; then
 fi
 
 # 数据库结构迁移（用子 shell 切换 cwd，避免影响后续步骤的工作目录）
-if [ -x "${VENV_DIR}/bin/python" ] && [ -d "${MP_SRC}" ]; then
+if [ -x "${PYTHON}" ] && [ -d "${MP_SRC}" ]; then
     (
         cd "${MP_SRC}" && \
-        CONFIG_DIR="${CONFIG_DIR}" "${VENV_DIR}/bin/python" \
+        CONFIG_DIR="${CONFIG_DIR}" "${PYTHON}" \
             -c "from app.db.init import init_db, update_db; init_db(); update_db()"
     ) >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 || true
 fi

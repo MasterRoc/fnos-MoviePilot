@@ -1,4 +1,5 @@
 .local-build/
+.workbuddy-ai/
 *.fpk
 *.fpk.sha256sum
 *.log

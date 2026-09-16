@@ -5,7 +5,7 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
 ==========================================================================
 功能：
   1. 下载 MoviePilot V3 后端源码与前端 dist，统一收敛到 .local-build/
-  2. （可选 --with-venv）构建 Python 依赖 venv 到 .local-build/venv
+  2. （可选 --with-runtime）准备自带 Python 运行时与全部依赖到 .local-build/python
   3. 在 .local-build/pkg/ 组装干净的应用目录树（只含进包内容）
   4. 按开发机平台自动下载 fnpack 并打包
   5. 产物命名 moviepilot-<version>.fpk
@@ -17,12 +17,33 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
   - 打包目录里只有该进包的内容，项目根目录不残留任何构建产物
 
 用法：
-  python build.py                # 默认
-  python build.py --force        # 强制重新下载
-  python build.py --clean        # 构建前清理 .local-build
-  python build.py --skip-mp      # 跳过下载后端源码
-  python build.py --skip-fe      # 跳过下载前端
-  python build.py --arch arm64   # 显式指定目标架构（用于裁剪 sites 原生变体）
+  python build.py                  # 默认
+  python build.py --force          # 强制重新下载
+  python build.py --clean          # 构建前清理 .local-build
+  python build.py --skip-mp        # 跳过下载后端源码
+  python build.py --skip-fe        # 跳过下载前端
+  python build.py --arch arm64     # 显式指定目标架构（用于裁剪 sites 原生变体）
+  python build.py --with-runtime --arch arm64
+                                   # 打包自带 Python 3.14 运行时与全部依赖
+  python build.py --with-runtime --allow-build
+                                   # 同上，但允许从源码构建依赖（默认只用预编译 wheel）
+
+自带 Python 运行时（--with-runtime）：
+  MoviePilot V3 的 pyproject.toml 声明 requires-python >=3.14，而 fnOS 应用中心
+  只提供 python312，所以应用必须自带解释器（官方 docker/Dockerfile 同样自带
+  /opt/python）。做法是下载 python-build-standalone 的 CPython 3.14，用 uv 按
+  uv.lock 把依赖直接装进它的 site-packages —— 不用 venv，因为 venv 的 bin/python
+  是指向构建机绝对路径的符号链接，打进包搬到 NAS 必然失效。整套 app/python/
+  是可重定位的，安装时无需在 NAS 上做任何二次安装。
+
+  构建期有三道自检，任何一道不过就终止（宁可构建失败，也不打出能装不能跑的包）：
+    1. 依赖自检   —— 用自带解释器实际 import fastapi/uvicorn/sqlalchemy/pydantic
+    2. glibc 审计 —— wheel 标签的 manylinux 基线不得高于 fnOS(Debian 12, glibc 2.36)；
+                     PBS 不自带 _manylinux 策略，pip/uv 会按 runner 的 glibc 2.39 选包
+    3. 路径断言   —— python/bin/python3、bin/python、lib/python3.14/site-packages 必须存在
+
+  仅 Linux/macOS 可用（无法交叉准备 Linux 运行时）。缺省不打包运行时，安装时
+  退回 fnOS python312 在线安装依赖。
 
 目标架构（--arch）：
   MoviePilot-Resources 内置 python311-314 × linux-amd64/aarch64/darwin/win 的
@@ -54,12 +75,34 @@ PKG_DIR = BUILD_DIR / "pkg"                   # 组装后的打包目录（临�
 # 下载/构建产物统一放 .local-build 下，不污染项目根
 MP_DIR = BUILD_DIR / "mp"                     # 后端源码
 FE_DIR = BUILD_DIR / "frontend"               # 前端 dist
-VENV_DIR = BUILD_DIR / "venv"                 # Python 虚拟环境（--with-venv 时）
+PYTHON_DIR = BUILD_DIR / "python"             # 自带 Python 运行时 + 依赖（--with-runtime 时）
 VERSION_FILE = BUILD_DIR / "versions.json"
 
 FNPACK_VERSION = "1.2.3"
 MAIN_PROXY = "https://gh-proxy.com/"
 ALT_PROXY = "https://ghfast.top/"
+
+# 自带 Python 运行时：MoviePilot V3 的 pyproject 要求 requires-python >=3.14，
+# 而 fnOS 应用中心只提供 python312，所以必须自带解释器（官方 Docker 镜像同样自带
+# /opt/python）。运行时版本与打包产物必须一致，sites 原生变体也按它来挑。
+PYTHON_VERSION = "3.14"
+PYTHON_FULL_VERSION = "3.14.7"
+# python-build-standalone 的发行版 tag 与资产命名（固定以保证构建可复现；
+# 资源下架时改这两个常量即可，报错信息里会提示）
+PBS_TAG = "20260901"
+PBS_REPO = "astral-sh/python-build-standalone"
+PBS_ASSET = "cpython-" + PYTHON_FULL_VERSION + "+" + PBS_TAG + "-{abi}-unknown-linux-gnu-install_only_stripped.tar.gz"
+PBS_ASSET_ARCH = {"amd64": "x86_64", "arm64": "aarch64"}
+# pyproject.toml 中的运行时依赖组（另见官方 Dockerfile 的 uv sync --group）
+RUNTIME_GROUP = "runtime-standard"
+# 目标系统 glibc 基线：fnOS 基于 Debian 12（bookworm），glibc 2.36。
+# 用 uv 的 --python-platform 把 wheel 选择限制在该基线内，从源头杜绝
+# "在 glibc 2.39 的 runner 上装到 manylinux_2_39 的 wheel、搬到 NAS 起不来"。
+GLIBC_BASELINE = (2, 36)
+UV_PLATFORM = {
+    "amd64": f"x86_64-manylinux_{GLIBC_BASELINE[0]}_{GLIBC_BASELINE[1]}",
+    "arm64": f"aarch64-manylinux_{GLIBC_BASELINE[0]}_{GLIBC_BASELINE[1]}",
+}
 
 # 打进包的仓库源码目录（相对项目根），会被组装进 pkg/app 及 pkg/
 SRC_DIRS = ["cmd", "config", "wizard"]
@@ -122,17 +165,13 @@ def get_app_version():
 
 
 def get_runtime_pyver():
-    """从 manifest install_dep_apps 读取依赖运行时 Python 版本（python312 -> "312"）。"""
-    manifest_file = PROJECT_DIR / "manifest"
-    try:
-        for line in manifest_file.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("install_dep_apps") and "=" in line:
-                m = re.search(r"python(\d{3})", line)
-                if m:
-                    return m.group(1)
-    except Exception as e:
-        log(f"警告: 读取 install_dep_apps 失败，使用默认 312: {e}")
-    return "312"
+    """返回自带运行时的 Python 版本号，如 "314"。
+
+    刻意**不再**从 manifest 的 install_dep_apps 读取：那声明的是 fnOS 提供的
+    运行时（只有 python312），而本应用自带 Python 3.14 运行。sites 原生变体
+    必须按自带版本挑，否则会选出 ABI 不匹配的 .so。
+    """
+    return PYTHON_VERSION.replace(".", "")
 
 
 def get_frontend_version():
@@ -218,7 +257,9 @@ def sha256_of(path):
 # ---------------------------------------------------------------------------
 def fetch_moviepilot(force=False):
     mp_dir = MP_DIR
-    if not force and (mp_dir / "requirements.txt").exists():
+    # 缓存判断用 pyproject.toml：MoviePilot V3 起不再提供 requirements.txt，
+    # 沿用旧判断会导致每次构建都重新下载一遍源码。
+    if not force and (mp_dir / "pyproject.toml").exists():
         log("==> MoviePilot 源码已存在，跳过")
         return
     backend_ref, is_tag = get_backend_version()
@@ -314,8 +355,18 @@ def fetch_resources(force=False):
 
 
 # ---------------------------------------------------------------------------
-# 打包 Python 依赖 venv（实现安装时完全不联网）
-# 仅支持在 Linux/macOS 上按目标架构构建；Windows 无法交叉编译 Linux venv。
+# 自带 Python 运行时 + 依赖（实现安装时完全不联网，且不依赖 fnOS 的 Python 版本）
+#
+# 为什么自带解释器：MoviePilot V3 的 pyproject.toml 声明 requires-python >=3.14，
+# 而 fnOS 应用中心只提供 python312。官方 docker/Dockerfile 的做法同样是自带
+# /opt/python 与 /opt/venv。
+#
+# 为什么不用 venv：venv 的 bin/python 是指向基础解释器的符号链接，pyvenv.cfg 里
+# 还写着构建机的绝对路径，打进包搬到 NAS 必然失效。这里直接把依赖装进自带解释器
+# 的 site-packages —— python-build-standalone 的发行版是可重定位的（sys.prefix
+# 由二进制位置推导），整个 app/python/ 目录搬到哪儿都能跑，安装时无需二次操作。
+#
+# 仅支持在 Linux/macOS 上准备 Linux 运行时；Windows 无法交叉准备。
 # ---------------------------------------------------------------------------
 PIP_MIRRORS = [
     "https://mirrors.aliyun.com/pypi/simple/",
@@ -394,126 +445,287 @@ def _strip_so_binaries(venv_dir):
     log(f"==> 已 strip {len(files)} 个 .so 文件的调试符号")
 
 
-def build_venv(force=False):
-    plat = get_platform()
-    if plat == "windows":
-        log("警告: Windows 上无法交叉编译 Linux venv，跳过全量打包（安装时将在线安装依赖）")
-        return False
-
-    mp_src = MP_DIR
-    venv_dir = VENV_DIR
-    marker = venv_dir / ".bundled_deps_done"
-
-    if not force and marker.exists():
-        log("==> 已存在打包好的 venv，跳过")
-        return True
-
-    if not (mp_src / "requirements.txt").exists():
-        log("警告: 缺少 MoviePilot 源码，无法构建 venv")
-        return False
-
-    py = shutil.which("python3")
-    if not py:
-        log("错误: 未找到 python3，无法构建 venv")
-        sys.exit(1)
-
-    log("==> 构建并打包 Python 依赖 venv ...")
-    if venv_dir.exists():
-        shutil.rmtree(venv_dir)
-    subprocess.run([py, "-m", "venv", str(venv_dir)], check=True)
-    pip = venv_dir / "bin" / "pip"
-    if not pip.exists():
-        pip = venv_dir / "Scripts" / "pip.exe"
-
-    ok = False
-    for i, mirror in enumerate(PIP_MIRRORS):
+def _ensure_uv():
+    """返回 uv 可执行文件路径；没有就装到 .local-build/tools/uvvenv 里（不动系统环境）。"""
+    uv = shutil.which("uv")
+    if uv:
+        log(f"==> 使用系统 uv: {uv}")
+        return uv
+    is_win = get_platform() == "windows"
+    tool_venv = TOOLS_DIR / "uvvenv"
+    uv_bin = tool_venv / ("Scripts/uv.exe" if is_win else "bin/uv")
+    if uv_bin.exists():
+        return str(uv_bin)
+    py = shutil.which("python3") or sys.executable
+    log("==> 安装 uv（用于按 uv.lock 安装依赖）...")
+    subprocess.run([py, "-m", "venv", str(tool_venv)], check=True)
+    pip = tool_venv / ("Scripts/pip.exe" if is_win else "bin/pip")
+    for mirror in PIP_MIRRORS:
         host = mirror.split("//")[1].split("/")[0]
-        log(f"  pip 镜像({i + 1}/{len(PIP_MIRRORS)}): {mirror}")
-        try:
-            subprocess.run([str(pip), "install", "--upgrade", "pip",
+        r = subprocess.run([str(pip), "install", "--upgrade", "uv",
                             "-i", mirror, "--trusted-host", host],
                            capture_output=True, text=True)
-            r = subprocess.run([str(pip), "install", "-r", str(mp_src / "requirements.txt"),
-                                "-i", mirror, "--trusted-host", host],
-                               capture_output=True, text=True)
-            if r.returncode == 0:
-                ok = True
-                break
-            log(f"  pip 镜像失败: {r.stderr[-300:]}")
-        except Exception as e:
-            log(f"  pip 镜像异常: {e}")
-    if not ok:
-        log("错误: Python 依赖安装失败，无法全量打包")
+        if r.returncode == 0 and uv_bin.exists():
+            return str(uv_bin)
+    log("错误: 安装 uv 失败（无法按 uv.lock 安装依赖）")
+    sys.exit(1)
+
+
+def fetch_python_runtime(target_arch, force=False):
+    """下载并解出自带 Python 运行时，返回其根目录（含 bin/python3）。"""
+    if get_platform() == "windows":
+        log("警告: Windows 上无法准备 Linux Python 运行时，跳过自带运行时")
+        return None
+    abi = PBS_ASSET_ARCH.get(target_arch or "")
+    if not abi:
+        log(f"错误: 目标架构 {target_arch!r} 无法映射到 Python 运行时资产")
         sys.exit(1)
 
-    log(f"==> venv 原始体积: {_size_mb(venv_dir):.1f} MB")
-    _log_site_packages_top(venv_dir)
+    if not force and (PYTHON_DIR / "bin" / "python3").exists():
+        log("==> Python 运行时已就绪，跳过下载")
+        return PYTHON_DIR
 
-    log("==> 清理 venv：tests/testing 目录、strip 调试符号、缓存/元数据 ...")
-    _remove_pkg_tests(venv_dir)
-    _strip_so_binaries(venv_dir)
-    _trim_venv(venv_dir)
-    log(f"==> venv 清理后体积: {_size_mb(venv_dir):.1f} MB")
+    asset = PBS_ASSET.format(abi=abi)
+    # 资产名里的 "+" 必须编码成 %2B：GitHub 的 download 端点会把它当成空格，
+    # 直连与代理转发都可能 404（API 返回的 browser_download_url 也是 %2B）。
+    url = (f"https://github.com/{PBS_REPO}/releases/download/{PBS_TAG}/"
+           f"{asset.replace('+', '%2B')}")
+    log(f"==> 下载自带 Python 运行时 CPython {PYTHON_FULL_VERSION} ({abi}) ...")
+    tar_path = BUILD_DIR / asset
+    if not download(url, tar_path, force):
+        log(f"下载 Python 运行时失败: {url}")
+        log("     若该资源已下架，请更新 build.py 的 PBS_TAG / PYTHON_FULL_VERSION 常量")
+        sys.exit(1)
+
+    if PYTHON_DIR.exists():
+        shutil.rmtree(PYTHON_DIR)
+    extract = BUILD_DIR / "python_src"
+    if extract.exists():
+        shutil.rmtree(extract)
+    shutil.unpack_archive(str(tar_path), str(extract))
+    inner = extract / "python"
+    if not inner.is_dir():
+        log(f"错误: Python 运行时包结构异常（未找到 python/ 目录）: {tar_path}")
+        sys.exit(1)
+    shutil.move(str(inner), str(PYTHON_DIR))
+    shutil.rmtree(extract, ignore_errors=True)
+    log(f"==> Python 运行时就绪: {_size_mb(PYTHON_DIR):.1f} MB")
+    return PYTHON_DIR
+
+
+def export_lock_requirements(uv, mp_src):
+    """把 uv.lock 导出成 requirements.txt 形式，作为依赖安装的唯一依据。
+
+    用 --locked（与官方 Dockerfile 的 uv sync --locked 一致）：uv.lock 与
+    pyproject.toml 不一致时直接报错，避免"锁文件漂移却静默装出另一套依赖"。
+
+    用 --no-hashes：该清单同时会被打进包（app/mp/requirements.lock.txt），供 NAS 端
+    走国内镜像在线补装时使用；带 hash 会让 pip 进入 require-hashes 模式，一旦镜像
+    站提供的 wheel 与 PyPI 有字节差异（部分镜像会重打包）就会整体失败。镜像可靠性
+    优先于校验强度 —— 主路径（自带运行时）根本不需要在线安装。
+    """
+    out = BUILD_DIR / "requirements.lock.txt"
+    log(f"==> 从 uv.lock 导出锁定依赖清单（group={RUNTIME_GROUP}）...")
+    cmd = [uv, "export", "--locked", "--no-emit-project",
+           "--no-default-groups", "--group", RUNTIME_GROUP,
+           "--no-hashes", "--format", "requirements-txt", "-o", str(out)]
+    # 同样隔离 VIRTUAL_ENV / UV_PROJECT_ENVIRONMENT：它们会让 uv 误以为已有项目环境，
+    # 从而把导出目标或解析平台换成别的东西。
+    env = dict(os.environ)
+    for k in ("VIRTUAL_ENV", "CONDA_PREFIX", "UV_PROJECT_ENVIRONMENT"):
+        env.pop(k, None)
+    r = subprocess.run(cmd, cwd=str(mp_src), capture_output=True, text=True, env=env)
+    if r.returncode != 0 or not out.exists():
+        log(f"错误: uv export 失败:\n{(r.stderr or r.stdout)[-1500:]}")
+        sys.exit(1)
+    lines = [ln for ln in out.read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    log(f"    已导出 {len(lines)} 条依赖")
+    return out
+
+
+def install_deps(python_dir, uv, req_file, allow_build=False, python_platform=None):
+    """把依赖装进自带解释器的 site-packages（不用 venv，保证目录可整体搬移）。
+
+    默认加 --no-build 强制只用预编译 wheel：CI runner 的 glibc 比 fnOS 新，一旦在
+    runner 上从源码编译，产出的 .so 很可能在 NAS 上跑不起来。宁可构建期报错，
+    也不要打出"能装不能跑"的包。确有纯 Python 的 sdist-only 依赖时可传
+    allow_build=True 放宽。
+
+    关于 --system：python-build-standalone 的 install_only 前缀没有 pyvenv.cfg，属于
+    "系统式"环境，直觉上似乎必须加 --system。实测（uv 0.12.15）并非如此 —— 只要用
+    --python 显式给出解释器，uv 就直接以该解释器自身的前缀为安装目标，日志为
+    "Using Python 3.14.x environment at: <prefix>"，无需 --system。因此这里先按默认
+    方式尝试，失败才退回 --system（真 venv 加 --system 会被 uv 拒绝，所以只能兜底）。
+    """
+    py = python_dir / "bin" / "python3"
+    if not py.exists():
+        py = python_dir / "bin" / "python"
+    if not py.exists():
+        log(f"错误: 自带解释器不存在: {python_dir}/bin/python3")
+        sys.exit(1)
+
+    base = [uv, "pip", "install", "--python", str(py)]
+    if not allow_build:
+        base.append("--no-build")
+    if python_platform:
+        base += ["--python-platform", python_platform]
+    base += ["--no-cache", "-r", str(req_file)]
+    attempts = [base, base + ["--system"]]
+
+    # 隔离环境干扰：若调用方 shell 里带着 VIRTUAL_ENV，uv 可能优先采用它而不是
+    # --python 指定的解释器，导致依赖被装到别处（甚至装到构建机上）。
+    env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)
+    env.pop("CONDA_PREFIX", None)
+
+    log("==> 安装 MoviePilot 依赖到自带运行时"
+        f"（{'允许源码构建' if allow_build else '仅用预编译 wheel'}）...")
+    err = ""
+    for i, cmd in enumerate(attempts):
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if r.returncode == 0:
+            log("==> 依赖安装完成")
+            return
+        err = r.stderr or r.stdout
+        if i == 0 and "--system" in attempts[1]:
+            log("    默认方式失败，加 --system 重试")
+    log("错误: 依赖安装失败:")
+    log(err[-2500:])
+    log("     若上面报的是「no wheels available / 需要从源码构建」，说明该包缺少"
+        " cpython-314 的预编译 wheel；确认它是纯 Python 包后可加 --allow-build 放宽。")
+    sys.exit(1)
+
+
+def _audit_wheel_glibc(python_dir, max_glibc=(2, 36)):
+    """审计装好的 wheel 的 manylinux 基线，拦截"能装但起不来"的包。
+
+    为什么需要这道检查：python-build-standalone 不自带 _manylinux 兼容策略模块，
+    于是 pip / uv 按**运行主机**的 glibc 判定兼容上限。CI runner 是 ubuntu-24.04
+    （glibc 2.39），而 fnOS 基于 Debian 12（glibc 2.36）—— 如果某个包提供了
+    manylinux_2_39 的 wheel，runner 上会顺利装上，搬到 NAS 却会因
+    "version `GLIBC_2.39' not found" 直接崩。wheel 标签里写着目标基线，
+    在构建期读出来断言即可，比事后在 NAS 上猜要便宜得多。
+    """
+    site = _site_packages_dir(python_dir)
+    if not site:
+        log("警告: 未找到 site-packages，跳过 wheel glibc 审计")
+        return
+    limit = max_glibc[0] * 100 + max_glibc[1]
+    bad, seen = [], 0
+    for wheel in sorted(site.glob("*.dist-info/WHEEL")):
+        try:
+            text = wheel.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        seen += 1
+        for tag in re.findall(r"^Tag:\s*(\S+)$", text, re.MULTILINE):
+            m = re.search(r"manylinux_(\d+)_(\d+)", tag)
+            if m and (int(m.group(1)) * 100 + int(m.group(2))) > limit:
+                bad.append((wheel.parent.name, tag))
+    if bad:
+        log(f"错误: 以下 wheel 要求的 glibc 高于目标系统 {max_glibc[0]}.{max_glibc[1]}"
+            "（fnOS / Debian 12），在 NAS 上会因找不到 GLIBC 符号而无法加载：")
+        for name, tag in bad[:40]:
+            log(f"    {name}  ->  {tag}")
+        log("     处理办法：为该包指定较老的 manylinux 版本，或改用"
+            " --allow-build 从源码编译（会绑上 runner 的 glibc，通常更糟），"
+            "或在 build.py 中调整 max_glibc。")
+        sys.exit(1)
+    log(f"==> wheel glibc 审计通过（{seen} 个包，基线均不高于 "
+        f"{max_glibc[0]}.{max_glibc[1]}）")
+
+
+def _smoke_test(python_dir):
+    """用自带解释器实际 import 关键依赖，验证装出来的环境真的能跑。
+
+    CI runner 与目标 NAS 同架构（arm64 runner / amd64 runner），所以这里能直接
+    执行该解释器。重点覆盖三类：纯 Python（fastapi/uvicorn）、Rust 扩展
+    （pydantic_core）、C 扩展（sqlalchemy 的 C 加速）。失败即终止构建。
+    """
+    py = python_dir / "bin" / "python3"
+    if not py.exists() or not os.access(str(py), os.X_OK):
+        log(f"警告: 无法执行自带解释器（{py}），跳过依赖自检")
+        return
+    code = ("import fastapi, uvicorn, sqlalchemy, pydantic, pydantic_core, orjson;"
+            "print('SMOKE_OK')")
+    r = subprocess.run([str(py), "-c", code], capture_output=True, text=True)
+    if r.returncode != 0 or "SMOKE_OK" not in r.stdout:
+        log("错误: 自带运行时依赖自检失败（关键依赖无法 import）:")
+        log((r.stderr or r.stdout)[-1500:])
+        sys.exit(1)
+    ver = subprocess.run([str(py), "-V"], capture_output=True, text=True)
+    log(f"==> 依赖自检通过（{(ver.stdout or ver.stderr).strip()}）")
+
+
+def build_runtime(target_arch, force=False, allow_build=False):
+    """准备自带 Python 运行时并把 MoviePilot 依赖装进去。"""
+    if get_platform() == "windows":
+        log("警告: Windows 上无法准备 Linux 运行时，产物将不含依赖（安装时需在线安装）")
+        return False
+    if not (MP_DIR / "pyproject.toml").exists():
+        log("错误: 缺少 MoviePilot 源码（pyproject.toml），无法准备依赖")
+        sys.exit(1)
+
+    marker = BUILD_DIR / ".runtime_ready"
+    if not force and marker.exists() and (PYTHON_DIR / "bin" / "python3").exists():
+        log("==> 自带运行时与依赖已就绪，跳过")
+        return True
+
+    uv = _ensure_uv()
+    fetch_python_runtime(target_arch, force)
+    req = export_lock_requirements(uv, MP_DIR)
+    python_platform = UV_PLATFORM.get(target_arch) if target_arch else None
+    install_deps(PYTHON_DIR, uv, req, allow_build, python_platform)
+
+    log(f"==> 依赖安装后体积: {_size_mb(PYTHON_DIR):.1f} MB")
+    _log_site_packages_top(PYTHON_DIR)
+
+    # 装完先验环境再裁剪：裁剪会动文件，出问题时应先看到"环境本身不完整"。
+    _smoke_test(PYTHON_DIR)
+    _audit_wheel_glibc(PYTHON_DIR)
+
+    log("==> 裁剪运行时：CPython 测试套件、各包 tests 目录、strip 符号 ...")
+    _trim_runtime(PYTHON_DIR)
+    _remove_pkg_tests(PYTHON_DIR)
+    _strip_so_binaries(PYTHON_DIR)
+    log(f"==> 运行时最终体积: {_size_mb(PYTHON_DIR):.1f} MB")
+
+    # cmd/* 依赖 ${TRIM_APPDEST}/python 下的这几个路径，缺一个应用就起不来。
+    # 打包前在这里断言，避免"CI 全绿但包里缺解释器"的历史问题重演。
+    for rel in ("bin/python3", "bin/python", "lib/python3.14/site-packages"):
+        if not (PYTHON_DIR / rel).exists():
+            log(f"错误: 自带运行时缺少必要路径: python/{rel}")
+            sys.exit(1)
 
     marker.write_text("ok", encoding="utf-8")
-    log("venv 打包完成")
+    log("自带运行时打包完成")
     return True
 
 
-def _trim_venv(venv_dir):
-    """删除 venv 中可安全移除的缓存/元数据，减小包体。
+def _trim_runtime(python_dir):
+    """裁剪自带运行时里运行时用不到的部分。
 
-    只清理以下（运行时自动重建，删除无副作用）：
-      - __pycache__ 目录
-      - *.pyc / *.pyo 字节码
-      - *.dist-info / *.egg-info 安装元数据
-    绝不删除 .so/.pyd/.dylib/.dll 等二进制及包本体。
+    只删 CPython 自带的测试套件（lib/pythonX.Y/test，几十 MB），无功能影响。
+
+    刻意**保留**两样东西：
+      - site-packages 与标准库的 __pycache__/*.pyc：它们由同一个 3.14.7 解释器
+        生成，magic 号必然匹配，留着能让应用首次启动免去重编译（langchain 之类
+        动辄上千个模块，现场编译会让首次启动慢很多）。
+      - .dist-info / .egg-info：importlib.metadata 靠它读包版本，删掉会让依赖
+        自检与版本展示出错（旧版 _trim_venv 删过，是个坑）。
     """
-    import re
-    if not venv_dir.exists():
+    if not python_dir.exists():
         return
-    removed_files = 0
-    removed_dirs = 0
-    site_pkgs = venv_dir / "lib"
-    if get_platform() == "windows":
-        site_pkgs = venv_dir / "Lib"
-
-    # 扫描范围：site-packages + 顶层
-    scan_roots = [venv_dir]
-    if site_pkgs.exists():
-        for ver in site_pkgs.iterdir():
-            sp = ver / "site-packages"
-            if sp.exists():
-                scan_roots.append(sp)
-
-    for root in scan_roots:
-        if not root.exists():
-            continue
-        for dirpath, dirnames, filenames in os.walk(root):
-            # 删除 __pycache__ 目录
-            if "__pycache__" in dirnames:
-                pycache = os.path.join(dirpath, "__pycache__")
-                shutil.rmtree(pycache, ignore_errors=True)
-                removed_dirs += 1
-                dirnames.remove("__pycache__")
-            # 删除 .dist-info / .egg-info 目录
-            keep_dirs = []
-            for d in dirnames:
-                if d.endswith(".dist-info") or d.endswith(".egg-info"):
-                    shutil.rmtree(os.path.join(dirpath, d), ignore_errors=True)
-                    removed_dirs += 1
-                else:
-                    keep_dirs.append(d)
-            dirnames[:] = keep_dirs
-            # 删除 .pyc/.pyo 文件
-            for f in filenames:
-                if f.endswith((".pyc", ".pyo")):
-                    try:
-                        os.remove(os.path.join(dirpath, f))
-                        removed_files += 1
-                    except OSError:
-                        pass
-    log(f"清理完成: 删除 {removed_dirs} 个缓存目录, {removed_files} 个字节码文件")
+    removed = 0
+    lib = python_dir / "lib"
+    if lib.is_dir():
+        for ver in lib.iterdir():
+            t = ver / "test"
+            if t.is_dir():
+                shutil.rmtree(t, ignore_errors=True)
+                removed += 1
+    log(f"==> 运行时裁剪: 移除 {removed} 个 CPython 测试套件目录")
 
 
 # ---------------------------------------------------------------------------
@@ -607,9 +819,9 @@ def _filter_sites_binaries(pkg_mp_dir, target_arch=None):
 #     manifest, ICON.PNG, ICON_256.PNG, README.md
 #     cmd/  config/  wizard/
 #     app/
-#       bin/  mp/  frontend/  venv/  ui/
+#       bin/  mp/  frontend/  python/  ui/
 # ---------------------------------------------------------------------------
-def prepare_pkg(include_venv, target_arch=None):
+def prepare_pkg(include_runtime, target_arch=None):
     """把仓库源码 + 构建产物组装到 .local-build/pkg/，返回 pkg 目录。"""
     if PKG_DIR.exists():
         shutil.rmtree(PKG_DIR)
@@ -625,7 +837,7 @@ def prepare_pkg(include_venv, target_arch=None):
         if src.exists():
             shutil.copytree(src, PKG_DIR / sub, dirs_exist_ok=True, ignore=ignore_junk)
 
-    # 2. 仓库 app 源码（bin/ui）与构建产物（mp/frontend/venv）组装到 pkg/app/
+    # 2. 仓库 app 源码（bin/ui）与构建产物（mp/frontend）组装到 pkg/app/
     #    注意：app 源码要复制（保留项目根），构建产物用 copy（保留 .local-build 缓存供复用）
     for sub in SRC_APP_DIRS:
         src = PROJECT_DIR / "app" / sub
@@ -639,10 +851,20 @@ def prepare_pkg(include_venv, target_arch=None):
             log(f"警告: 缺少构建产物 app/{sub}，打包可能不完整")
     _filter_sites_binaries(pkg_app / "mp", target_arch)
 
-    if include_venv and VENV_DIR.exists():
-        shutil.copytree(VENV_DIR, pkg_app / "venv", dirs_exist_ok=True, ignore=ignore_junk)
+    # 3. 自带 Python 运行时 + 依赖。cmd/* 以 ${TRIM_APPDEST}/python 作为解释器根，
+    #    所以这里**不能**套 ignore_junk —— 标准库与 site-packages 的 .pyc 由同一个
+    #    3.14.7 解释器生成，留着能让首次启动免去重编译。
+    if include_runtime and PYTHON_DIR.exists():
+        shutil.copytree(PYTHON_DIR, pkg_app / "python", dirs_exist_ok=True)
+    elif include_runtime:
+        log("警告: 缺少自带 Python 运行时 app/python，安装时将退回 fnOS python312 在线装依赖")
 
-    # 3. 顶层文件
+    # 4. 锁定依赖清单随包分发：NAS 端在线补装时用它（上游 V3 已无 requirements.txt）
+    lock = BUILD_DIR / "requirements.lock.txt"
+    if lock.exists() and (pkg_app / "mp").is_dir():
+        shutil.copy2(lock, pkg_app / "mp" / "requirements.lock.txt")
+
+    # 5. 顶层文件
     for f in ["manifest", "ICON.PNG", "ICON_256.PNG", "README.md"]:
         src = PROJECT_DIR / f
         if src.exists():
@@ -652,9 +874,9 @@ def prepare_pkg(include_venv, target_arch=None):
     return PKG_DIR
 
 
-def build_fpk(fnpack_bin, include_venv, target_arch=None):
+def build_fpk(fnpack_bin, include_runtime, target_arch=None):
     """在 .local-build/pkg/ 下调用 fnpack 打包，产物输出到项目根。"""
-    pkg = prepare_pkg(include_venv, target_arch)
+    pkg = prepare_pkg(include_runtime, target_arch)
     log("==> 打包 ...")
     result = subprocess.run([str(fnpack_bin), "build", "."], cwd=str(pkg))
     if result.returncode != 0:
@@ -683,8 +905,14 @@ def main():
     parser.add_argument("--arch", choices=["amd64", "arm64"], default=None,
                         help="目标 CPU 架构，用于裁剪 sites 原生变体。缺省取构建机架构；"
                              "Windows 上缺省则不裁剪（保留全部变体以保证兼容）")
-    parser.add_argument("--with-venv", action="store_true",
-                        help="把 Python 依赖 venv 一起打包进 fpk（安装时完全不联网；仅 Linux/macOS 可用）")
+    parser.add_argument("--with-runtime", "--with-venv", dest="with_runtime",
+                        action="store_true",
+                        help="把自带 Python 3.14 运行时与全部依赖一起打包进 fpk"
+                             "（安装时完全不联网；仅 Linux/macOS 可用）。"
+                             "--with-venv 为兼容旧命令保留的别名")
+    parser.add_argument("--allow-build", action="store_true",
+                        help="允许从源码构建依赖（默认禁止，只用预编译 wheel）。"
+                             "仅在确有纯 Python 的 sdist-only 依赖时使用")
     args = parser.parse_args()
 
     target_arch = resolve_target_arch(args.arch)
@@ -693,13 +921,13 @@ def main():
     else:
         log("==> 目标架构: 未显式指定（Windows 本地构建），sites 原生变体将全部保留")
 
-    # 捆绑 venv 时目标架构必须与构建机一致：venv 里的原生扩展（.so/.pyd）是按
-    # 构建机架构安装的，跨架构捆绑会得到一个能装但起不来的包，必须提前拦住。
-    if args.with_venv and target_arch and target_arch != get_platform_arch():
-        log(f"错误: --with-venv 要求目标架构与构建机架构一致，"
+    # 自带运行时的原生扩展（.so）是按构建机架构装出来的，跨架构捆绑会得到
+    # 一个能装但起不来的包，必须提前拦住。
+    if args.with_runtime and target_arch and target_arch != get_platform_arch():
+        log(f"错误: --with-runtime 要求目标架构与构建机架构一致，"
             f"当前目标 {target_arch} / 构建机 {get_platform_arch()}。")
         log("      请在与目标架构一致的机器（或 CI runner）上构建，"
-            "或去掉 --with-venv（安装时在线安装依赖）。")
+            "或去掉 --with-runtime（安装时在线安装依赖）。")
         sys.exit(1)
 
     if args.clean and BUILD_DIR.exists():
@@ -711,11 +939,27 @@ def main():
     if not args.skip_fe:
         fetch_frontend(args.force)
     fetch_resources(args.force)   # 资源包为 MoviePilot V3 必需，默认始终同步
-    if args.with_venv:
-        build_venv(args.force)
+
+    # 运行时是否真的打进包，必须显式确认：历史上 build_venv() 静默 return False，
+    # main() 又不看返回值，结果 CI 全绿却打出零依赖的包。这里把返回值当硬条件，
+    # 并且把结论打印在最后一行，便于在 CI 日志里一眼确认。
+    runtime_bundled = False
+    if args.with_runtime:
+        runtime_bundled = build_runtime(target_arch, args.force, args.allow_build)
+        if not runtime_bundled:
+            log("")
+            log("!!! 警告: 本次产物**不含** Python 运行时与依赖 !!!")
+            log("!!! 真机安装时将退回 fnOS python312 在线安装依赖（需联网且要求 NAS 可访问 PyPI）")
+            log("")
 
     fnpack_bin = ensure_fnpack(args.force)
-    build_fpk(fnpack_bin, args.with_venv, target_arch)
+    build_fpk(fnpack_bin, args.with_runtime, target_arch)
+
+    log("")
+    log("==> 构建结论")
+    log(f"    目标架构     : {target_arch or '未指定（保留全部 sites 变体）'}")
+    log(f"    自带运行时   : {'是（CPython ' + PYTHON_FULL_VERSION + ' + 全部依赖）' if runtime_bundled else '否（安装时需联网装依赖）'}")
+    log(f"    依赖清单     : {'app/mp/requirements.lock.txt' if (BUILD_DIR / 'requirements.lock.txt').exists() else '未生成'}")
 
 
 if __name__ == "__main__":
