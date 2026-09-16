@@ -270,6 +270,63 @@ def scenario_f():
         print("SKIP 前端包下载失败")
 
 
+def scenario_g():
+    """G 命令行契约：cmd/main 传的每个开关都必须是合法参数。
+
+    历史故障：cmd/main 的启动路径调用 `mp_updater --auto`，而 argparse 没有
+    定义 --auto，于是解析阶段直接 SystemExit(2)，do_update() 从未执行 ——
+    "重启即升级"静默失效（rc=2 被 cmd/main 的 `*)` 分支吞掉）。
+
+    这条检查不依赖平台与网络，直接钉住"脚本会拒绝自己的调用方"这类问题。
+    """
+    print("\n=== 场景 G：命令行参数契约（与 cmd/main 保持一致）===")
+    script = ROOT / "app" / "bin" / "mp_updater.py"
+    expected = ["--check", "--rollback", "--force", "--auto"]
+
+    # 1) 直接解析 argparse 定义，而不真的执行各开关：
+    #    --force / --rollback 会真的联网下载或回滚，跑起来既慢又不确定。
+    r = subprocess.run([sys.executable, str(script), "--help"],
+                       capture_output=True, text=True, timeout=60)
+    help_text = (r.stdout or "") + (r.stderr or "")
+    for name in expected:
+        check(f"G1 --help 列出 {name}", name in help_text,
+              help_text.strip().splitlines()[-1] if help_text else "(无输出)")
+
+    # 2) 关键回归：--auto 必须能被解析。
+    #    注意不能只看 rc==2 —— 脚本自身也用 EXIT_USAGE=2 表示"环境/用法错误"，
+    #    两者撞码。argparse 拒绝的**唯一可靠特征**是它打印 "unrecognized arguments"。
+    for name in ("--auto", "--force"):
+        try:
+            r = subprocess.run(
+                [sys.executable, str(script), name],
+                capture_output=True, text=True, timeout=45,
+                env={**os.environ,
+                     "CONFIG_DIR": str(SANDBOX / "pkgvar" / "config"),
+                     "MP_SRC": str(SANDBOX / "appdest" / "mp"),
+                     # 关掉自动更新，让 --auto 立刻走"跳过"分支，避免联网
+                     "MP_AUTO_UPDATE": "0"})
+        except subprocess.TimeoutExpired:
+            # 超时说明参数已被接受并进入了真实流程（旧代码是瞬间被拒绝）
+            check(f"G2 {name} 被接受（进入主流程而非 argparse 拒绝）", True)
+            continue
+        out = (r.stdout or "") + (r.stderr or "")
+        rejected = "unrecognized arguments" in out
+        check(f"G2 {name} 不是 argparse 拒绝的参数", not rejected,
+              f"rc={r.returncode} {out.strip()[:200]}")
+
+    # 3) 钉住 cmd/main 实际使用的调用形式，防止两边再次漂移
+    main_sh = (ROOT / "cmd" / "main").read_text(encoding="utf-8", errors="replace")
+    used = set()
+    for line in main_sh.splitlines():
+        s = line.strip()
+        if s.startswith("run_updater"):
+            for tok in s.split()[1:]:
+                if tok.startswith("--"):
+                    used.add(tok)
+    missing = sorted(t for t in used if t not in expected)
+    check("G3 cmd/main 用到的开关都在预期集合内", not missing, f"未定义: {missing}")
+
+
 if __name__ == "__main__":
     mod._real_smoke_test = mod.smoke_test
     scenario_a()
@@ -279,5 +336,6 @@ if __name__ == "__main__":
     scenario_d()
     scenario_e()
     scenario_f()
+    scenario_g()
     print("\n" + ("全部通过" if not FAILS else f"失败 {len(FAILS)} 项: {FAILS}"))
     sys.exit(1 if FAILS else 0)

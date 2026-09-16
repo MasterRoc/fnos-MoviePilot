@@ -6,7 +6,7 @@ MoviePilot fnOS 统一网关反向代理
 作用：把 fnOS 网关转发的 Unix Socket 流量，桥接到 MoviePilot 前端服务端口(默认 3000)，
 并完成：
   - 剥离网关前缀 /app/moviepilot
-  - 注入 JS polyfill（fetch/XHR/WebSocket 路径改写 + 反逃生）
+  - 注入 JS polyfill（fetch/XHR/WebSocket/EventSource 路径改写 + 反逃生）
   - WebSocket 原始 TCP 双向透传
   - 移除 X-Frame-Options、追加允许 iframe 的 CSP
   - 静态资源 LRU 缓存 + 后端连接池
@@ -81,6 +81,23 @@ def _build_polyfill():
         'XMLHttpRequest.prototype.open=function(m,u,s){'
         'if(typeof u==="string"&&u.charAt(0)==="/"&&!u.startsWith(P)){arguments[1]=P+u;}'
         'return _o.apply(this,arguments);};'
+        # EventSource：MoviePilot 的实时消息流（通知中心、系统日志）用它而非 fetch。
+        # 它不走 fetch/XHR，天然绕过上面的改写；一旦前端用绝对路径（"/api/..."）
+        # 就会静默打到网关根路径而拿不到数据，且不会像 fetch 那样留下明显的失败。
+        # 这里与 fetch/XHR 保持同一套改写规则。
+        'var _es=window.EventSource;'
+        'if(_es){'
+        'window.EventSource=function(u,c){'
+        'if(typeof u==="string"&&u.charAt(0)==="/"&&!u.startsWith(P)){u=P+u;}'
+        'return c?new _es(u,c):new _es(u);};'
+        # 静态常量必须一并复制：MoviePilot 的 SSE 封装里有
+        # `readyState===EventSource.CLOSED` 这类比较，丢了会永远判为未关闭。
+        'var _esC=["CONNECTING","OPEN","CLOSED"];'
+        'for(var _i=0;_i<_esC.length;_i++){'
+        'var _k=_esC[_i];'
+        'try{window.EventSource[_k]=_es[_k];}catch(e){}'
+        '}'
+        'window.EventSource.prototype=_es.prototype;}'
         'var _cw=window.WebSocket;'
         'if(_cw){'
         'window.WebSocket=function(u,p){'

@@ -111,7 +111,13 @@ def missing_items(res_dir: Path) -> list:
         for p in res_dir.iterdir():
             if not p.is_file():
                 continue
-            if p.name.startswith(DATA_PREFIX) and p.suffix == DATA_SUFFIX:
+            # 索引必须**恰好是**当前约定的那一版（user.sites.<RESOURCE_FLAG>.bin）。
+            # 只判断 "user.sites.*.bin" 会放过历史版本：上游资源仓库同时分发
+            # user.sites.bin / user.sites.v2.bin / user.sites.v3.bin，站点扩展只认与
+            # 自己匹配的那一份。若拿着一份 v2 索引去喂 v3 扩展，站点列表同样是空的
+            # （表现为"站点认证"页 No data available），但检查却报"资源完整"，
+            # 于是修复逻辑被跳过、故障永远无法自愈。
+            if p.name == f"{DATA_PREFIX}{RESOURCE_FLAG}{DATA_SUFFIX}":
                 have_data = True
             elif p.name in wanted:
                 have_native = True
@@ -121,6 +127,26 @@ def missing_items(res_dir: Path) -> list:
     if not have_native:
         missing.extend(sorted(wanted))
     return missing
+
+
+def stale_index_files(res_dir: Path) -> list:
+    """返回资源目录里存在的、非当前版本的站点索引文件。
+
+    这些文件不会被使用（扩展只认 user.sites.<RESOURCE_FLAG>.bin），留着的唯一
+    后果是干扰排查：目录看起来"有索引"，实际解不出站点。修复时顺手清掉。
+    """
+    if not res_dir.is_dir():
+        return []
+    current = f"{DATA_PREFIX}{RESOURCE_FLAG}{DATA_SUFFIX}"
+    out = []
+    for p in res_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.name == current:
+            continue
+        if p.name.startswith(DATA_PREFIX) and p.suffix == DATA_SUFFIX:
+            out.append(p)
+    return out
 
 
 def native_extension_path(res_dir: Path):
@@ -192,6 +218,24 @@ def source_dirs(mp_src: Path) -> list:
     return dirs
 
 
+def _purge_stale_indexes(res_dir: Path) -> int:
+    """删除不匹配当前版本的站点索引，返回删除数量。
+
+    这些文件永远不会被 sites 扩展读取（它只认 user.sites.<RESOURCE_FLAG>.bin），
+    删除是安全的；保留它们只会掩盖"当前版索引其实缺失"这一事实。
+    """
+    removed = 0
+    for stale in stale_index_files(res_dir):
+        try:
+            stale.unlink()
+            log(f"  清理过期的站点索引 {stale.name}"
+                f"（仅使用 {DATA_PREFIX}{RESOURCE_FLAG}{DATA_SUFFIX}）")
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def repair(mp_src: Path, python_bin: str = "") -> int:
     res_dir = resolve_resource_dir(mp_src, create=True)
     try:
@@ -205,6 +249,9 @@ def repair(mp_src: Path, python_bin: str = "") -> int:
     if not missing:
         if native_loadable(res_dir, python_bin):
             log(f"站点资源完整且可加载: {rel}")
+            # 即便无需修复，也要清掉不匹配的历史索引：它们永远不会被读取，
+            # 留着只会让排查时误以为"索引在位"。
+            _purge_stale_indexes(res_dir)
             return 0
         log(f"站点资源文件齐全但无法加载，尝试覆盖修复: {rel}")
         broken = True
@@ -212,6 +259,7 @@ def repair(mp_src: Path, python_bin: str = "") -> int:
     if not broken:
         log(f"站点资源缺失: {rel} 缺 {', '.join(missing)}")
     wanted = wanted_native_names()
+    current_index = f"{DATA_PREFIX}{RESOURCE_FLAG}{DATA_SUFFIX}"
     copied = 0
     # 可加载性失败时，本地那份已经是坏的，必须允许从备份覆盖它
     overwrite = broken
@@ -221,7 +269,9 @@ def repair(mp_src: Path, python_bin: str = "") -> int:
         for p in sorted(src.iterdir()):
             if not p.is_file():
                 continue
-            is_data = p.name.startswith(DATA_PREFIX) and p.suffix == DATA_SUFFIX
+            # 只搬"当前版本"的索引：历史版本（user.sites.bin / user.sites.v2.bin）
+            # 搬过去也没用，反而让目录看起来已有索引、掩盖真正缺的那一份。
+            is_data = p.name == current_index
             is_native = p.name in wanted
             if not (is_data or is_native):
                 continue
@@ -251,6 +301,8 @@ def repair(mp_src: Path, python_bin: str = "") -> int:
         log("修复未完成：所有可用来源的 sites 原生扩展均无法加载")
         log("提示: 本机资源全部不可用，通常需要重新安装应用包（fpk）")
         return 1
+    # 清掉不匹配的历史索引：它们不会被使用，留着只会让排查时误以为索引在位。
+    _purge_stale_indexes(res_dir)
     log(f"修复完成，补回 {copied} 个文件到 {rel}")
     return 0
 

@@ -103,6 +103,11 @@ RESOURCE_SUBDIRS = (
     ("adapters", "network"),
     ("helper",),
 )
+# 站点索引的版本标记，与 mp_resources.RESOURCE_FLAG 必须一致。
+# 上游资源仓库同时分发 user.sites.bin / user.sites.v2.bin / user.sites.v3.bin，
+# 只有与当前 sites 扩展匹配的那一份能被解出站点列表；用旧版会让"站点认证"页
+# 显示 No data available，而文件看起来都在。
+RESOURCE_FLAG = "v3"
 
 # 只认 v3.x.y（可带 alpha/beta/rc 后缀）：上游仓库同时存在 v1/v2 历史 tag 与
 # dev 之类非版本引用，一律不接受，避免"升级"到旧版本或不明引用
@@ -656,20 +661,36 @@ def restore_helper_resources(backup_root: Path, dst_root: Path) -> int:
     源目录要在备份树里按新旧顺序全找一遍：老版本把资源放在 app/helper，
     新版代码却要 app/application/site，只认"与新版同名的目录"会一个都
     找不到，于是更新完就起不来。
+
+    两个刻意的取舍：
+      * 只回填满足 RESOURCE_FLAG 的那份索引（user.sites.<flag>.bin）。备份里
+        可能同时躺着 user.sites.bin / v2 / v3，把旧版一起搬过去没有意义，
+        它们永远不会被扩展读取。
+      * 目标已存在同名文件时默认不覆盖（保留新版自带的资源），但**索引例外**：
+        索引是纯数据，其格式与 sites 扩展存在版本约定。若新代码自带了更新的
+        扩展而目标目录里仍是上一代的索引，就必须用备份里的当前版覆盖，否则
+        更新后站点列表为空（站点认证页 No data available）而文件却"都在"。
     """
     src_dirs = _existing_resource_dirs(backup_root)
     if not src_dirs:
         return 0
     dst_dir = resolve_resource_dir(dst_root, create=True)
+    current_index = f"user.sites.{RESOURCE_FLAG}.bin"
     restored = 0
     for src_dir in src_dirs:
         for f in sorted(src_dir.iterdir()):
             if not f.is_file():
                 continue
+            is_index = f.name.startswith("user.sites.") and f.suffix == ".bin"
+            if is_index and f.name != current_index:
+                continue  # 旧版索引不回填
             keep = f.name in HELPER_KEEP_EXACT or f.name.startswith(HELPER_KEEP_PREFIX)
-            if not keep or (dst_dir / f.name).exists():
+            if not keep:
                 continue
-            shutil.copy2(str(f), str(dst_dir / f.name))
+            dst = dst_dir / f.name
+            if dst.exists() and not is_index:
+                continue
+            shutil.copy2(str(f), str(dst))
             restored += 1
     if restored:
         log(f"    回填 {restored} 个资源包文件到 "
@@ -687,9 +708,19 @@ def verify_site_resources(mp_src: Path) -> None:
     res_dir = resolve_resource_dir(mp_src)
     if not res_dir.is_dir():
         raise UpdateError(f"站点资源目录不存在: {res_dir}")
-    if not any(p.name.startswith("user.sites.") and p.suffix == ".bin"
-               for p in res_dir.iterdir()):
-        raise UpdateError(f"站点资源目录缺少索引数据文件: {res_dir}")
+    # 索引必须**恰好**是当前约定的那一版。上游资源仓库同时分发
+    # user.sites.bin / user.sites.v2.bin / user.sites.v3.bin，扩展只认与自己匹配的
+    # 那一份；只判断 "user.sites.*.bin" 会放过"只有旧版索引"的情况，于是更新闸门
+    # 放行、留下一个站点列表为空的版本（站点认证页 No data available）。
+    wanted_index = f"user.sites.{RESOURCE_FLAG}.bin"
+    if not (res_dir / wanted_index).is_file():
+        present = sorted(p.name for p in res_dir.iterdir()
+                         if p.is_file() and p.name.startswith("user.sites.")
+                         and p.suffix == ".bin")
+        raise UpdateError(
+            f"站点资源目录缺少 {wanted_index}"
+            + (f"（现有旧版索引: {', '.join(present)}）" if present else "")
+            + f": {res_dir}")
     ver = f"{sys.version_info.major}{sys.version_info.minor}"
     machine = platform.machine().lower()
     if machine in ("arm64", "aarch64"):
@@ -1158,6 +1189,13 @@ def main() -> int:
     parser.add_argument("--rollback", action="store_true", help="回滚到最近一次更新前的备份")
     parser.add_argument("--force", action="store_true",
                         help="忽略 MP_AUTO_UPDATE 开关与检查冷却（手动更新用）")
+    # --auto 是"遵守 MP_AUTO_UPDATE 开关与检查冷却"的**默认行为**，本身不做任何事。
+    # 但必须显式声明：cmd/main 的启动路径调用的是 `mp_updater --auto`，缺了它
+    # argparse 会在解析阶段直接 SystemExit(2)，do_update() 根本没机会执行，于是
+    # "重启即升级"静默失效（rc=2 落进 cmd/main 的 `*)` 分支，只记一行
+    # "更新检查未完成（rc=2）"）。历史上这个功能因此一次都没生效过。
+    parser.add_argument("--auto", action="store_true",
+                        help="遵守 MP_AUTO_UPDATE 开关与检查冷却（启动路径用，默认行为）")
     args = parser.parse_args()
 
     cfg = Config()

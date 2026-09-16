@@ -11,6 +11,10 @@
   C 修复：从候选来源（含 .mp-backup）回填缺失文件
   D 覆盖修复：本地那份坏掉时，允许用备份覆盖它
   E 幂等：资源完整且可加载时不做任何改动
+  F 无来源可修时返回 1
+  G 索引版本：只有历史版本索引（user.sites.bin / v2）时必须判定为"缺当前版"
+    —— 上游资源仓库同时分发三份索引，只判断 "user.sites.*.bin" 会把
+    "拿着旧索引喂新扩展"误判成完整，站点列表依旧为空却永远不修复
 """
 import os
 import shutil
@@ -133,6 +137,54 @@ def main():
     (site / data_name()).unlink()
     rc = res.repair(mp, "")
     check("F1 返回 1（修复失败）", rc == 1, f"rc={rc}")
+
+    print()
+    print("== G. 索引版本：旧版索引不能顶替当前版 ==")
+    mp, site = build_sandbox(with_backup=False)
+    # 当前版索引被换成历史版本（上游资源仓库真实存在的 user.sites.bin / v2.bin）
+    (site / data_name()).rename(site / "user.sites.v2.bin")
+    miss = res.missing_items(site)
+    check("G1 只有 v2 索引时判定缺当前版索引", data_name() in miss, f"{miss}")
+    check("G2 v2 索引被识别为过期文件",
+          [p.name for p in res.stale_index_files(site)] == ["user.sites.v2.bin"],
+          f"{[p.name for p in res.stale_index_files(site)]}")
+
+    # 无版本号的那份也要同样处理
+    (site / "user.sites.v2.bin").rename(site / "user.sites.bin")
+    miss = res.missing_items(site)
+    check("G3 只有无版本索引时同样判定缺当前版", data_name() in miss, f"{miss}")
+
+    # 当前版索引在位时不应被判缺失
+    (site / "user.sites.bin").rename(site / data_name())
+    check("G4 当前版索引在位时不再报缺失",
+          data_name() not in res.missing_items(site),
+          f"{res.missing_items(site)}")
+
+    print()
+    print("== H. 修复时不会搬来旧版索引，并清掉过期索引 ==")
+    mp, site = build_sandbox(with_backup=False)
+    res.native_loadable = lambda d, py: True
+    # 备份里只有一份旧版索引 + 正确的扩展：修复必须失败（缺当前版索引）
+    (site / data_name()).unlink()
+    bk = SANDBOX / ".mp-backup" / "20260101-000000" / "app" / "application" / "site"
+    bk.mkdir(parents=True, exist_ok=True)
+    (bk / "user.sites.v2.bin").write_bytes(b"\x00" * 256)
+    (bk / native_name()).write_bytes(b"\x7fELF" + b"b" * 512)
+    rc = res.repair(mp, "")
+    check("H1 备份只有旧版索引时修复失败（返回 1）", rc == 1, f"rc={rc}")
+    check("H2 旧版索引没有被搬进资源目录",
+          not (site / "user.sites.v2.bin").exists())
+
+    print()
+    print("== I. 过期索引会被清理 ==")
+    mp, site = build_sandbox(with_backup=False)
+    res.native_loadable = lambda d, py: True
+    # 当前版索引在位（完整），另外多出一份过期索引 -> 修复应清掉它
+    (site / "user.sites.v2.bin").write_bytes(b"\x00" * 256)
+    rc = res.repair(mp, "")
+    check("I1 完整时 repair 返回 0", rc == 0, f"rc={rc}")
+    check("I2 过期索引已被清理", not (site / "user.sites.v2.bin").exists())
+    check("I3 当前版索引保留", (site / data_name()).exists())
 
     print()
     if FAILS:
