@@ -53,6 +53,13 @@ _NO_CACHE_BASENAMES = frozenset({
     'service-worker.js', 'service.js', 'manifest.webmanifest', 'index.html',
 })
 
+# 认证头改名（见 _build_polyfill 内的详细说明）。
+#   AUTH_HEADER     —— 后端（MoviePilot）认的请求头
+#   AUTH_HEADER_ALT —— 浏览器里实际发送的头；fnOS 网关只校验前者，校验不过会
+#                      直接返回 200 text/plain "invalid token"，请求到不了应用
+AUTH_HEADER = "Authorization"
+AUTH_HEADER_ALT = "X-MP-Auth"
+
 # 懒加载 queue 模块（保持启动快）
 _queue = None
 def _get_queue():
@@ -84,14 +91,47 @@ def _build_polyfill():
         '<script>'
         '(function(){'
         'var P="%s";'
+        'var A="%s",B="%s";'
+        # fnOS 网关把 Authorization 当成**它自己的**令牌来校验：MoviePilot 的 JWT
+        # 校验不过，网关直接返回 200 text/plain "invalid token"（13 字节），请求
+        # 根本到不了应用。前端因此拿到非 JSON，表现为登录之后所有页面报
+        # 「服务器返回了无效响应」、仪表盘与关于页数据全空、站点认证 No data
+        # available。自定义头不会被网关校验，所以这里把该头改名为 X-MP-Auth，
+        # 由 gateway-proxy 转发时再翻译回 Authorization 交给后端。
+        'function _isA(n){return String(n).toLowerCase()==="authorization";}'
+        'function _rh(h){'
+        'if(!h){return h;}'
+        'var o={},i,k;'
+        'if(typeof h.forEach==="function"&&typeof h.get==="function"){'
+        'h.forEach(function(v,n){o[_isA(n)?B:n]=v;});'
+        'return o;}'
+        'if(Object.prototype.toString.call(h)==="[object Array]"){'
+        'for(i=0;i<h.length;i++){o[_isA(h[i][0])?B:h[i][0]]=h[i][1];}'
+        'return o;}'
+        'for(k in h){if(Object.prototype.hasOwnProperty.call(h,k)){o[_isA(k)?B:k]=h[k];}}'
+        'return o;}'
         'var _f=window.fetch;'
         'window.fetch=function(u,o){'
         'if(typeof u==="string"&&u.charAt(0)==="/"&&!u.startsWith(P)){u=P+u;}'
+        'if(o&&o.headers){o=Object.assign({},o);o.headers=_rh(o.headers);}'
+        'else if(u&&typeof u==="object"&&u.headers&&window.Headers&&window.Request){'
+        'try{'
+        'var hh=new Headers(u.headers);'
+        'if(hh.has(A)){hh.set(B,hh.get(A));hh.delete(A);}'
+        'u=new Request(u,{headers:hh});'
+        '}catch(e){}'
+        '}'
         'return _f.call(this,u,o);};'
         'var _o=XMLHttpRequest.prototype.open;'
         'XMLHttpRequest.prototype.open=function(m,u,s){'
         'if(typeof u==="string"&&u.charAt(0)==="/"&&!u.startsWith(P)){arguments[1]=P+u;}'
         'return _o.apply(this,arguments);};'
+        'var _srh=XMLHttpRequest.prototype.setRequestHeader;'
+        'if(_srh){'
+        'XMLHttpRequest.prototype.setRequestHeader=function(n,v){'
+        'if(_isA(n)){n=B;}'
+        'return _srh.call(this,n,v);};'
+        '}'
         # EventSource：MoviePilot 的实时消息流（通知中心、系统日志）用它而非 fetch。
         # 它不走 fetch/XHR，天然绕过上面的改写；一旦前端用绝对路径（"/api/..."）
         # 就会静默打到网关根路径而拿不到数据，且不会像 fetch 那样留下明显的失败。
@@ -133,7 +173,7 @@ def _build_polyfill():
         '}catch(e){}}'
         '}'
         '})();'
-        '</script>' % P
+        '</script>' % (P, AUTH_HEADER, AUTH_HEADER_ALT)
     )
 
 _POLYFILL_BYTES = _build_polyfill().encode()
@@ -363,6 +403,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         for k, v in self.headers.items():
             if k.lower() not in skip:
                 headers[k] = v
+        # 还原被 polyfill 改名的认证头（原因见 AUTH_HEADER_ALT 的注释）：
+        # 浏览器只能发 X-MP-Auth（Authorization 会被 fnOS 网关拦掉），后端只认
+        # Authorization，所以在最后一跳翻译回来。仅在没有 Authorization 时补齐，
+        # 不影响经 Unix socket 直连、自带 Authorization 的调用方。
+        for _k in list(headers):
+            if _k.lower() == AUTH_HEADER_ALT.lower():
+                _alt = headers.pop(_k)
+                if not any(_h.lower() == AUTH_HEADER.lower() for _h in headers):
+                    headers[AUTH_HEADER] = _alt
+                break
         backend_url = "http://%s:%d" % (TARGET_HOST, port)
         headers["Host"] = "%s:%d" % (TARGET_HOST, port)
         headers["Accept-Encoding"] = "gzip, deflate"

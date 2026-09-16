@@ -36,6 +36,17 @@ Node 前端  frontend-server.js  (127.0.0.1:3005)
 Python 后端  app/main.py  (127.0.0.1:3002)
 ```
 
+### 为什么要改写 Authorization 头
+
+fnOS 统一网关会把请求里的 `Authorization` 当成**它自己的**令牌来校验。MoviePilot 用同一个头传 JWT，
+网关校验不过就直接返回 `200 text/plain "invalid token"`（13 字节），请求根本到不了应用。后果是
+登录之后**所有带认证的接口都失败**：仪表盘 CPU/内存/系统信息全空、关于页的认证资源版本与站点资源
+版本为空、推荐与订阅报「服务器返回了无效响应」、站点认证选站点显示 No data available。
+
+因此 `gateway-proxy.py` 注入的 polyfill 会把该头改名为 `X-MP-Auth`（自定义头网关不校验），代理在
+转发到前端服务时再还原成 `Authorization` 交给后端。回归断言见 `tools/polyfill_smoke.py` 的 H 组与
+端到端用例。
+
 ### 为什么要自带 Python 3.14
 
 MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS 应用中心提供的运行时是 `python312` —— 版本不够。官方 Docker 镜像的处理方式同样是自带解释器（`/opt/python`）。本应用沿用同一思路：

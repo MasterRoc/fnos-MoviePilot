@@ -54,6 +54,12 @@ def extract_polyfill() -> tuple[str, str]:
         'APPNAME = "moviepilot"\n'
         f'GATEWAY_PREFIX = "{GATEWAY_PREFIX}"\n'
     )
+    # _build_polyfill 会引用这两个模块级常量（认证头原名/改名），从源码里取真值
+    # 而不是在测试里另写一份，避免两边漂移。
+    for _name in ("AUTH_HEADER", "AUTH_HEADER_ALT"):
+        _m = re.search(rf'^{_name} = "([^"]+)"', src, re.M)
+        if _m:
+            prefix += f'{_name} = "{_m.group(1)}"\n'
     m = re.search(
         r"def _build_polyfill\(\):.*?\n_POLYFILL_BYTES = _build_polyfill\(\)\.encode\(\)",
         src, re.S,
@@ -111,6 +117,14 @@ def main() -> int:
           '_esC=["CONNECTING","OPEN","CLOSED"]' in inner)
     check("B. 网关前缀来自 GATEWAY_PREFIX 常量",
           f'var P="{GATEWAY_PREFIX}";' in inner)
+    # fnOS 网关把 Authorization 当作自己的令牌校验：MoviePilot 的 JWT 会被判成
+    # "invalid token"（200 text/plain），请求到不了应用 —— 登录之后所有页面数据
+    # 全空。必须改名成自定义头，再由 gateway-proxy 翻译回 Authorization。
+    check("B. 改写 XHR setRequestHeader（认证头改名）",
+          "XMLHttpRequest.prototype.setRequestHeader=function" in inner)
+    check("B. fetch 也会改名认证头", "_rh(o.headers)" in inner)
+    check("B. 改名目标为 X-MP-Auth",
+          'var A="Authorization",B="X-MP-Auth";' in inner)
 
     if not node_ok():
         print("\nSKIP: 未找到 node，无法做语法与行为校验（不计为失败）")
@@ -167,17 +181,21 @@ const inner = fs.readFileSync(path.join(__dirname, "_polyfill_inner.js"), "utf-8
 const P = "/app/moviepilot";
 
 function sandbox() {
-  const calls = { es: [] };
+  const calls = { es: [], fetch: [] };
   class FakeES {
     constructor(u, o) { this.url = u; this.opts = o; this.readyState = 0; calls.es.push([u, o]); }
     close() { this.readyState = 2; }
   }
   FakeES.CONNECTING = 0; FakeES.OPEN = 1; FakeES.CLOSED = 2;
-  class FakeXHR { open() {} }
+  class FakeXHR {
+    constructor() { this.headers = []; }
+    open() {}
+    setRequestHeader(n, v) { this.headers.push([n, v]); }
+  }
   class FakeWS { constructor() {} close() {} }
   FakeWS.prototype.send = function () {};
   const window = {
-    fetch: function () { return Promise.resolve(); },
+    fetch: function (u, o) { calls.fetch.push([u, o]); return Promise.resolve(); },
     EventSource: FakeES, WebSocket: FakeWS, XMLHttpRequest: FakeXHR,
     location: { protocol: "http:", host: "192.168.0.8:5666" },
   };
@@ -220,6 +238,33 @@ let threw = null;
 try { run(s); } catch (e) { threw = e; }
 t("EventSource 缺失时不抛错", threw === null);
 
+// --- H 认证头改名 ---------------------------------------------------------
+// fnOS 网关把 Authorization 当成它自己的令牌：MoviePilot 的 JWT 会被判成
+// "invalid token"（200 text/plain，13 字节），请求到不了应用。所以浏览器侧必须
+// 改名成 X-MP-Auth（网关不校验自定义头），由 gateway-proxy 翻译回 Authorization。
+s = sandbox(); run(s);
+const xhr = new s.window.XMLHttpRequest();
+xhr.setRequestHeader("Authorization", "Bearer jwt-abc");
+t("H1 XHR 的 Authorization 改名为 X-MP-Auth",
+  xhr.headers.length === 1 && xhr.headers[0][0] === "X-MP-Auth" && xhr.headers[0][1] === "Bearer jwt-abc");
+xhr.setRequestHeader("authorization", "Bearer jwt-def");
+t("H2 大小写不敏感", xhr.headers[1][0] === "X-MP-Auth");
+xhr.setRequestHeader("X-MoviePilot-Locale", "zh-CN");
+t("H3 其它头原样保留",
+  xhr.headers[2][0] === "X-MoviePilot-Locale" && xhr.headers[2][1] === "zh-CN");
+
+s = sandbox(); run(s);
+s.window.fetch("/api/v1/system/ping", { headers: { Authorization: "Bearer jwt-x", Accept: "application/json" } });
+const fh = s.calls.fetch[0][1].headers;
+t("H4 fetch 普通对象头改名",
+  fh["X-MP-Auth"] === "Bearer jwt-x" && fh["Authorization"] === undefined && fh["Accept"] === "application/json");
+t("H5 fetch 路径仍被改写", s.calls.fetch[0][0] === P + "/api/v1/system/ping");
+
+const s2 = sandbox(); run(s2);
+const orig = { headers: { Authorization: "Bearer jwt-y" } };
+s2.window.fetch("/api/x", orig);
+t("H6 不修改调用方原始对象", orig.headers.Authorization === "Bearer jwt-y");
+
 process.exit(fail === 0 ? 0 : 1);
 """
 
@@ -241,10 +286,10 @@ function t(name, cond, extra) {
   console.log((cond ? "  ok   " : "  BAD  ") + name + (cond || !extra ? "" : "  <- " + extra));
   if (!cond) fail++;
 }
-function get(port, p) {
+function get(port, p, headers) {
   return new Promise((res, rej) => {
-    const rq = http.request({ host: "127.0.0.1", port, path: p, method: "GET" }, (r) => {
-      let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res({ status: r.statusCode, body: b }));
+    const rq = http.request({ host: "127.0.0.1", port, path: p, method: "GET", headers: headers || {} }, (r) => {
+      let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res({ status: r.statusCode, body: b, headers: r.headers }));
     });
     rq.on("error", rej); rq.end();
   });
@@ -252,7 +297,12 @@ function get(port, p) {
 
 const fe = http.createServer((req, res) => {
   if (req.url.startsWith("/api/")) {
-    res.writeHead(401, { "Content-Type": "application/json" });
+    // 回显上游真正看到的认证头：用于断言代理把 X-MP-Auth 翻译回了 Authorization。
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "X-Echo-Auth": req.headers["authorization"] || "",
+      "X-Echo-Alt": req.headers["x-mp-auth"] || "",
+    });
     res.end(JSON.stringify({ detail: "Not authenticated" }));
     return;
   }
@@ -310,6 +360,20 @@ http.server.ThreadingHTTPServer(("127.0.0.1", ${PROXY_PORT}), H).serve_forever()
     t("前缀常量正确", html.body.includes('var P="/app/moviepilot";'));
     const api = await get(PROXY_PORT, "/app/moviepilot/api/v1/system/message?role=notification");
     t("API 前缀剥离并透传 401（非 502）", api.status === 401, "status=" + api.status);
+    // fnOS 网关只放行自定义头，Authorization 会被判成 "invalid token"；
+    // 所以 polyfill 改名、代理在这一跳翻译回来，后端必须still 看到 Authorization。
+    const authProbe = await get(PROXY_PORT, "/app/moviepilot/api/v1/system/ping",
+      { "X-MP-Auth": "Bearer jwt-probe" });
+    t("代理把 X-MP-Auth 翻译回 Authorization 交给上游",
+      authProbe.headers["x-echo-auth"] === "Bearer jwt-probe",
+      "echo=" + authProbe.headers["x-echo-auth"]);
+    t("翻译后不再向上游暴露 X-MP-Auth",
+      !authProbe.headers["x-echo-alt"], "alt=" + authProbe.headers["x-echo-alt"]);
+    const authDirect = await get(PROXY_PORT, "/app/moviepilot/api/v1/system/ping",
+      { "Authorization": "Bearer jwt-direct" });
+    t("调用方自带 Authorization 时不被覆盖",
+      authDirect.headers["x-echo-auth"] === "Bearer jwt-direct",
+      "echo=" + authDirect.headers["x-echo-auth"]);
     // 静态缓存行为：普通 .js 进 LRU，稳定文件名 PWA 资源必须绕过 LRU。
     // 不修的话，升级后浏览器会一直用旧 Service Worker 拉旧 chunk —— 表现是
     // 界面报「服务器返回了无效响应」且"刷新后重试"永远无效。
