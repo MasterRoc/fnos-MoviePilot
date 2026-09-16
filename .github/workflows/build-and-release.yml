@@ -43,7 +43,9 @@ jobs:
         # 在 .local-build/tools 下 pip 装一个，不污染 runner 环境）。
         # v5 的 runs.using 是 node20，GitHub 已弃用（runner 强制用 node24 跑并刷警告），
         # v10 起改为 node24，故升到 v10。
-        uses: astral-sh/setup-uv@v10
+        # 注意：setup-uv 只发 x.y.z 全量标签，没有 v10 这种大版本浮动标签
+        # （写 @v10 会直接 Unable to resolve action），必须写全。
+        uses: astral-sh/setup-uv@v10.1.0
         with:
           # 与本地验证过的版本保持一致；升级前先在本地跑一遍依赖安装回归。
           version: '0.12.15'
