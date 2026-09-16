@@ -41,7 +41,17 @@ jobs:
         # 可选加速：build.py 会用 uv 按 uv.lock 装依赖。装了这里就能省掉 pip 安装 uv
         # 的一步；万一该 action 不可用也不影响构建（build.py 的 _ensure_uv 会自行
         # 在 .local-build/tools 下 pip 装一个，不污染 runner 环境）。
-        uses: astral-sh/setup-uv@v5
+        # v5 的 runs.using 是 node20，GitHub 已弃用（runner 强制用 node24 跑并刷警告），
+        # v10 起改为 node24，故升到 v10。
+        uses: astral-sh/setup-uv@v10
+        with:
+          # 与本地验证过的版本保持一致；升级前先在本地跑一遍依赖安装回归。
+          version: '0.12.15'
+          # 本仓库不含 uv.lock / pyproject.toml（依赖来自构建期下载的上游 MoviePilot
+          # 源码），默认 glob 匹配不到任何文件 → 既刷 "No file matched to ..." 警告，
+          # 又会生成一个永不失效的缓存键。缓存对我们没有意义（依赖不随本仓库变化），
+          # 直接关掉，省下 GitHub 的缓存配额（免费版仅 500 MB，产物本身已占大头）。
+          enable-cache: false
         continue-on-error: true
 
       - name: Read version from manifest
