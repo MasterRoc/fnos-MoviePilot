@@ -53,7 +53,7 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
   全部 sites 原生变体（约 31M）。打包时会按目标架构只保留匹配的一个，减体积
   约 28M。--arch 缺省时取构建机架构；Windows 上缺省则不裁剪（保留全部变体），
   因为 fnpack 在 Windows 上无法产出与目标 NAS 绑定的包，宁可包大也不打出
-  缺 app.helper.sites 的坏包。
+  缺 sites 模块的坏包（该模块所在目录随上游重构变过，见 fetch_resources）。
 
 说明：
   本应用为 Python 后端 + 预编译前端，无需交叉编译原生二进制、无需 npm 构建。
@@ -316,16 +316,63 @@ def fetch_frontend(force=False):
 
 
 # ---------------------------------------------------------------------------
-# 下载 MoviePilot-Resources 资源包并同步到 mp/app/helper
-# MoviePilot V3 依赖资源仓库提供 app/helper/sites.py 等文件，缺失会导致
-# "No module named 'app.helper.sites'" 而无法初始化数据库/超级管理员
+# 下载 MoviePilot-Resources 资源包并同步到后端源码的站点资源目录
+# MoviePilot V3 的 sites 模块（Cython 扩展 + user.sites 数据）不在主仓库里，
+# 由 MoviePilot-Resources 单独分发。缺失会导致
+# "No module named 'app.<...>.sites'"，后端在 import 阶段就崩，无法启动。
+#
+# 该目录随上游重构搬过家，写死任何一个都会在某天打出起不来的包：
+#   app/helper            （早期 V3）
+#   app/adapters/network
+#   app/infrastructure
+#   app/application/site  （>= 3.0.3，当前）
+# 所以一律按"上游源码里实际存在哪个目录"来定位，顺序与上游
+# app.adapters.system.update._resource_source_dir() 的查找顺序保持一致。
 # ---------------------------------------------------------------------------
 RESOURCE_FLAG = "v3"
 RESOURCES_ZIP = "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip"
+# 相对 app/ 的候选资源目录，按优先级从新到旧
+RESOURCE_SUBDIRS = (
+    ("application", "site"),
+    ("infrastructure",),
+    ("adapters", "network"),
+    ("helper",),
+)
+
+
+def _resource_candidate_dirs(mp_dir):
+    """返回后端源码里所有存在的候选资源目录（按优先级从新到旧）。"""
+    app_dir = Path(mp_dir) / "app"
+    found = []
+    for parts in RESOURCE_SUBDIRS:
+        candidate = app_dir
+        for part in parts:
+            candidate = candidate / part
+        if candidate.is_dir():
+            found.append(candidate)
+    return found
+
+
+def resolve_resource_dir(mp_dir, create=False):
+    """定位后端源码应当接收资源包产物的目录。
+
+    优先用上游源码里真实存在的最"新"目录；一个都找不到时以当前约定
+    （app/application/site）为准 —— 此时源码多半还没解开，按新约定建目录
+    不会把文件放错地方。
+    """
+    found = _resource_candidate_dirs(mp_dir)
+    if found:
+        return found[0]
+    target = Path(mp_dir) / "app"
+    for part in RESOURCE_SUBDIRS[0]:
+        target = target / part
+    if create:
+        target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def fetch_resources(force=False):
-    helper_dir = MP_DIR / "app" / "helper"
+    helper_dir = resolve_resource_dir(MP_DIR, create=True)
     marker = helper_dir / f"user.sites.{RESOURCE_FLAG}.bin"
     if not force and marker.exists():
         log("==> 资源包已就绪，跳过")
@@ -354,7 +401,11 @@ def fetch_resources(force=False):
         log("资源目录中未找到可复制文件")
         sys.exit(1)
     shutil.rmtree(str(extract_dir))
-    log(f"资源同步完成，共 {len(copied)} 个文件到 app/helper")
+    try:
+        rel = helper_dir.relative_to(MP_DIR)
+    except ValueError:
+        rel = helper_dir
+    log(f"资源同步完成，共 {len(copied)} 个文件到 {rel}")
 
 
 # ---------------------------------------------------------------------------
@@ -871,9 +922,10 @@ def _filter_sites_binaries(pkg_mp_dir, target_arch=None):
 
     target_arch 为 None（无法判定目标架构）时跳过过滤、保留全部变体。
     """
-    helper = Path(pkg_mp_dir) / "app" / "helper"
-    if not helper.is_dir():
+    helper = _resource_candidate_dirs(pkg_mp_dir)
+    if not helper:
         return
+    helper = helper[0]
     if not target_arch:
         log("警告: 未指定且无法判定目标架构，跳过 sites 裁剪（保留全部变体，包体较大但兼容）")
         return

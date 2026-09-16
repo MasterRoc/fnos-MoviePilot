@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 1.0.1
+version               = 1.0.2
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。<br><br>🐛 <b>问题反馈：</b><a href="https://github.com/jxxghp/MoviePilot/issues" target="_blank">GitHub Issues</a>
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v1.0.1<br>1.修复启动/重启后短暂出现 502：后端 uvicorn 需先跑完 lifespan 才监听端口，前端新增“就绪门”，等待期间挂起 /api 请求而不是直接报错<br>2.后端 stdio 落盘到 backend.log，异常退出时记录退出码并回传日志末尾，启动失败不再无从排查<br>3.新增上游自动更新：应用启动时可就地升级 MoviePilot 后端与前端（安装向导可关闭），支持一键回滚<br>4.修复安装/修改配置时超级管理员初始化失败（V3 事务执行器未登记导致的“同步事务执行器尚未配置”），数据库初始化改用官方 prepare_database
+changelog             = v1.0.2<br>1.修复自更新到 MoviePilot 3.0.3 后后端无法启动（No module named 'app.application.site.sites'）：sites 资源目录随上游重构从 app/helper 迁至 app/application/site，构建与更新均改为按源码结构自动定位并回填<br>2.新增站点资源自愈：每次启动自动对位，也可用 cmd/main repair 手动修复，无需重新安装应用包<br>3.自更新新增资源在位性校验，回填失败即刻回滚，不再留下“更新成功但起不来”的版本<br><br>v1.0.1<br>1.修复启动/重启后短暂出现 502：后端 uvicorn 需先跑完 lifespan 才监听端口，前端新增“就绪门”，等待期间挂起 /api 请求而不是直接报错<br>2.后端 stdio 落盘到 backend.log，异常退出时记录退出码并回传日志末尾，启动失败不再无从排查<br>3.新增上游自动更新：应用启动时可就地升级 MoviePilot 后端与前端（安装向导可关闭），支持一键回滚<br>4.修复安装/修改配置时超级管理员初始化失败（V3 事务执行器未登记导致的“同步事务执行器尚未配置”），数据库初始化改用官方 prepare_database

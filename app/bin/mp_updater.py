@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -94,6 +95,14 @@ SYNC_FILES = ("version.py", "pyproject.toml", "uv.lock", "mypy.ini", "pytest.ini
 # 上游 zip 不含资源仓库产物（sites 二进制等），替换后必须回填
 HELPER_KEEP_PREFIX = ("user.sites.", "sites.", ".resource-compat")
 HELPER_KEEP_EXACT = (".resource-compat",)
+# 站点资源目录随上游重构搬过家，写死任何一个都会在升级后打出/留下起不来的应用。
+# 顺序与上游 app.adapters.system.update._resource_source_dir() 保持一致（新 → 旧）。
+RESOURCE_SUBDIRS = (
+    ("application", "site"),
+    ("infrastructure",),
+    ("adapters", "network"),
+    ("helper",),
+)
 
 # 只认 v3.x.y（可带 alpha/beta/rc 后缀）：上游仓库同时存在 v1/v2 历史 tag 与
 # dev 之类非版本引用，一律不接受，避免"升级"到旧版本或不明引用
@@ -605,30 +614,98 @@ def stage_replace(src_root: Path, dst_root: Path, backup_root: Path) -> list:
     return moves
 
 
+def _existing_resource_dirs(root: Path) -> list:
+    """返回 root 下所有存在的候选站点资源目录（新 → 旧）。"""
+    app_dir = Path(root) / "app"
+    found = []
+    for parts in RESOURCE_SUBDIRS:
+        candidate = app_dir
+        for part in parts:
+            candidate = candidate / part
+        if candidate.is_dir():
+            found.append(candidate)
+    return found
+
+
+def resolve_resource_dir(root: Path, create: bool = False) -> Path:
+    """定位 root 下应当存放站点资源产物的目录。
+
+    优先取源码里真实存在的最"新"目录；一个都找不到时按当前约定
+    （app/application/site）返回，create=True 时顺带建出来。
+    """
+    found = _existing_resource_dirs(root)
+    if found:
+        return found[0]
+    target = Path(root) / "app"
+    for part in RESOURCE_SUBDIRS[0]:
+        target = target / part
+    if create:
+        target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def restore_helper_resources(backup_root: Path, dst_root: Path) -> int:
     """回填资源仓库产物。
 
     上游 zip 里没有 MoviePilot-Resources 的 sites 二进制（它们在独立仓库），
-    而打包时我们已把它们放进 app/helper。整体替换 app/ 后必须把这些文件搬回来，
-    否则会出现 "No module named 'app.helper.sites'"。
+    而打包时我们已把它们放进后端源码的站点资源目录。整体替换 app/ 后必须
+    把这些文件搬回**新版代码认的那个目录**，否则后端在 import 阶段就崩
+    （老版本是 "No module named 'app.helper.sites'"，3.0.3 起变成
+    "No module named 'app.application.site.sites'"）。
+
+    源目录要在备份树里按新旧顺序全找一遍：老版本把资源放在 app/helper，
+    新版代码却要 app/application/site，只认"与新版同名的目录"会一个都
+    找不到，于是更新完就起不来。
     """
-    old_helper = backup_root / "app" / "helper"
-    new_helper = dst_root / "app" / "helper"
-    if not old_helper.is_dir():
+    src_dirs = _existing_resource_dirs(backup_root)
+    if not src_dirs:
         return 0
-    new_helper.mkdir(parents=True, exist_ok=True)
+    dst_dir = resolve_resource_dir(dst_root, create=True)
     restored = 0
-    for f in sorted(old_helper.iterdir()):
-        if not f.is_file():
-            continue
-        keep = f.name in HELPER_KEEP_EXACT or f.name.startswith(HELPER_KEEP_PREFIX)
-        if not keep or (new_helper / f.name).exists():
-            continue
-        shutil.copy2(str(f), str(new_helper / f.name))
-        restored += 1
+    for src_dir in src_dirs:
+        for f in sorted(src_dir.iterdir()):
+            if not f.is_file():
+                continue
+            keep = f.name in HELPER_KEEP_EXACT or f.name.startswith(HELPER_KEEP_PREFIX)
+            if not keep or (dst_dir / f.name).exists():
+                continue
+            shutil.copy2(str(f), str(dst_dir / f.name))
+            restored += 1
     if restored:
-        log(f"    回填 {restored} 个资源包文件到 app/helper")
+        log(f"    回填 {restored} 个资源包文件到 "
+            f"{dst_dir.relative_to(dst_root) if str(dst_dir).startswith(str(dst_root)) else dst_dir}")
     return restored
+
+
+def verify_site_resources(mp_src: Path) -> None:
+    """校验当前代码的站点资源目录里有本机能用的 sites 扩展。
+
+    这条检查是拿"更新器自己用的解释器"当判据的：cmd/main 用 $APP_PYTHON
+    跑本脚本，也就是后端真正用的那个解释器，所以这里的 ABI 标签与后端
+    运行期完全一致。缺失就直接判更新失败，宁可回滚也不留一个起不来的版本。
+    """
+    res_dir = resolve_resource_dir(mp_src)
+    if not res_dir.is_dir():
+        raise UpdateError(f"站点资源目录不存在: {res_dir}")
+    if not any(p.name.startswith("user.sites.") and p.suffix == ".bin"
+               for p in res_dir.iterdir()):
+        raise UpdateError(f"站点资源目录缺少索引数据文件: {res_dir}")
+    ver = f"{sys.version_info.major}{sys.version_info.minor}"
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        machine = "aarch64"
+    elif machine in ("x86_64", "amd64"):
+        machine = "x86_64"
+    wanted = []
+    if os.name == "posix" and sys.platform != "darwin":
+        wanted.append(f"sites.cpython-{ver}-{machine}-linux-gnu.so")
+    elif sys.platform == "darwin":
+        wanted.append(f"sites.cpython-{ver}-darwin.so")
+    else:
+        wanted.append(f"sites.cp{ver}-win_amd64.pyd")
+    if not any((res_dir / name).is_file() for name in wanted):
+        raise UpdateError(
+            f"站点资源目录缺少本机可用的 sites 扩展（需要 {' / '.join(wanted)}）: {res_dir}")
 
 
 def replace_frontend(staged: Path, frontend_dir: Path, backup_root: Path) -> bool:
@@ -757,18 +834,25 @@ def upstream_artifacts(cfg: Config, current: str):
 
 
 def apply_resource_files(cfg: Config, files: list) -> int:
-    """把上游下载好的站点资源文件装进 app/helper（打包时它们也放在这里）。"""
-    helper = cfg.mp_src / "app" / "helper"
-    helper.mkdir(parents=True, exist_ok=True)
+    """把上游下载好的站点资源文件装进当前代码认的站点资源目录。
+
+    目录名随上游重构变过（app/helper → app/application/site），这里按源码
+    实际结构解析，不能写死。
+    """
+    res_dir = resolve_resource_dir(cfg.mp_src, create=True)
     applied = 0
     for p in files:
         try:
-            shutil.copy2(str(p), str(helper / p.name))
+            shutil.copy2(str(p), str(res_dir / p.name))
             applied += 1
         except OSError as e:
             log(f"警告: 应用资源文件失败 {p.name}: {e}")
     if applied:
-        log(f"    应用 {applied} 个上游资源文件到 app/helper")
+        try:
+            rel = res_dir.relative_to(cfg.mp_src)
+        except ValueError:
+            rel = res_dir
+        log(f"    应用 {applied} 个上游资源文件到 {rel}")
     return applied
 
 
@@ -958,6 +1042,10 @@ def do_update(cfg: Config, args) -> int:
         restore_helper_resources(backup_dir, cfg.mp_src)
         if prepared and prepared.get("resources"):
             apply_resource_files(cfg, prepared["resources"])
+        # 资源回填失败等于"更新成功但起不来"，必须在回滚窗口内拦住。
+        # 只验文件存在性（不 import sites —— 它是 Cython 扩展，导入需要完整
+        # 依赖环境，而这里只想挡住"资源根本没搬过来"这一类问题）。
+        verify_site_resources(cfg.mp_src)
         if fe_staged is not None:
             replace_frontend(fe_staged, cfg.frontend_dir, backup_dir)
             current_fe = new_fe

@@ -118,7 +118,7 @@ ARCH=arm64 ./build.sh
 构建脚本会自动：
 1. 从 GitHub 下载 MoviePilot V3 源码到 `.local-build/mp`（打包内置）
 2. 从 GitHub Releases 下载前端 `dist.zip` 到 `.local-build/frontend`（打包内置）
-3. 同步 MoviePilot-Resources 资源包到 `mp/app/helper`（V3 必需，缺失会报 `No module named 'app.helper.sites'`）
+3. 同步 MoviePilot-Resources 资源包到后端源码的站点资源目录（V3 必需；目录名随上游重构变过，`app/helper` → `app/application/site`，构建时按源码结构自动定位，缺失会报 `No module named 'app.application.site.sites'`）
 4. （可选 `--with-runtime`）下载 CPython 3.14.7 到 `.local-build/python`，用 `uv` 按 `uv.lock` 装依赖，并做三道自检（依赖自检 / wheel glibc 审计 / 关键路径断言）
 5. 在 `.local-build/pkg/` 组装干净的应用目录树（仓库源码 + 构建产物），下载 fnpack 到 `.local-build/tools` 并打包生成 `moviepilot-<version>.fpk`
 
@@ -196,7 +196,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 1. 读本地版本（`mp/version.py`）→ 查 GitHub Release → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
 2. 下载后端 zip → 校验结构（有 `app/`、`version.py` 与 tag 一致）→ 解析出 `FRONTEND_VERSION`
 3. 依赖预检：用新 `uv.lock` 对比已装环境，缺什么补什么（`pip`，走国内镜像）
-4. 备份 → 替换 `app/ config/ database/ scripts/ skills/ moviepilot/` 与 `version.py` 等 → **回填资源包文件**（`app/helper/` 里的 sites 二进制来自独立仓库，上游 zip 里没有）
+4. 备份 → 替换 `app/ config/ database/ scripts/ skills/ moviepilot/` 与 `version.py` 等 → **回填资源包文件**（sites 二进制来自独立仓库，上游 zip 里没有）→ 校验资源在位（缺失直接判更新失败并回滚）
 5. 前端 dist 整体替换
 6. 自检（关键依赖 import + 源码语法编译），**失败即整树回滚**
 7. 写状态文件，保留最近 2 代备份
@@ -223,6 +223,8 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 /var/apps/moviepilot/target/cmd/main update-check
 # 回滚到更新前的版本（备份在 <应用目录>/.mp-backup/）
 /var/apps/moviepilot/target/cmd/main rollback
+# 修复站点资源（sites 模块错位/缺失导致后端起不来时）
+/var/apps/moviepilot/target/cmd/main repair
 ```
 
 更新日志：`TRIM_PKGVAR/update.log`；状态文件：`TRIM_PKGVAR/config/mp_update.json`。
@@ -267,6 +269,33 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 主管进程还会把"进程已启动"与"端口已可服务"分开记录（`后端已就绪：127.0.0.1:3002 可连接`），
 只有后者出现才代表后端真正开始对外服务。
+
+### `ModuleNotFoundError: No module named 'app.application.site.sites'`
+
+后端还在 import 阶段就崩了，主管进程会反复重启它。这不是依赖没装，而是**站点资源
+（sites 模块）不在位**：它是 Cython 扩展 + 索引数据，由独立的 MoviePilot-Resources
+仓库分发，不在 MoviePilot 主仓库里，打包与更新时回填。
+
+麻烦在于这个目录随上游重构搬过家：
+
+| 上游版本 | 资源目录 | 缺失时的报错 |
+|----------|----------|--------------|
+| 早期 V3 | `app/helper` | `No module named 'app.helper.sites'` |
+| ≥ 3.0.3 | `app/application/site` | `No module named 'app.application.site.sites'` |
+
+于是老包 + 自更新到新版代码的组合会出现"资源还留在旧目录、新代码找不到"。
+处理：
+
+```bash
+/var/apps/moviepilot/target/cmd/main repair
+```
+
+它会按当前源码结构重新对位，从历史目录或 `.mp-backup/` 里把资源文件找回来
+（纯文件复制、无网络、幂等）。每次 `start` 也会自动跑一遍。若日志提示"本机无法修复"，
+说明磁盘上确实没有这些文件了，重新安装应用包即可。
+
+> 构建侧已改为按源码结构自动定位资源目录（`build.py` 的 `resolve_resource_dir`），
+> 更新器在替换源码后会校验资源在位、缺失即回滚，不会再打出/留下这种版本。
 
 ## 免责声明
 

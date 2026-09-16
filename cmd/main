@@ -46,6 +46,7 @@ SUPER_PID_FILE="${TRIM_PKGTMP}/${APP_NAME}-super.pid"
 LOG_FILE="${TRIM_PKGVAR}/${APP_NAME}.log"
 GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
 MP_UPDATER="${BIN_DIR}/mp_updater.py"
+MP_RESOURCES="${BIN_DIR}/mp_resources.py"
 UPDATE_LOG="${TRIM_PKGVAR}/update.log"
 
 # 共享目录（用于写诊断日志，trim-cli 可读取）；未导出时跳过共享日志
@@ -151,6 +152,26 @@ run_updater() {
     return $rc
 }
 
+# ---------------------------------------------------------------------------
+# 站点资源自愈：sites 扩展在独立仓库，且其目录随上游重构搬过家
+# （app/helper → ... → app/application/site）。老包 + 自更新到新版代码的组合
+# 会出现"资源留在旧目录、新代码找不到"而起不来。这里在启动前按当前源码结构
+# 重新对位，纯文件复制、幂等、无网络，失败也不阻塞启动。
+# ---------------------------------------------------------------------------
+repair_resources() {
+    [ -f "$MP_RESOURCES" ] || return 0
+    [ -x "$APP_PYTHON" ] || return 0
+    export MP_SRC
+    local rc=0
+    "$APP_PYTHON" "$MP_RESOURCES" >> "$UPDATE_LOG" 2>&1 || rc=$?
+    case "$rc" in
+        0) log "==> 站点资源检查通过" ;;
+        1) log "==> 警告：站点资源缺失且本机无法修复（详见 ${UPDATE_LOG}），后端可能启动失败" ;;
+        *) log "==> 站点资源检查未完成（rc=$rc），继续启动" ;;
+    esac
+    return 0
+}
+
 start_app() {
     if is_running; then
         return 0
@@ -220,6 +241,8 @@ start)
     if [ "${MP_SKIP_UPDATE:-}" != "1" ]; then
         run_updater --auto || true
     fi
+    # 更新器会替换整个 app/，资源回填有可能落在旧目录，启动前统一对位一次
+    repair_resources
     start_app || exit 1
     log "=== started ==="
     exit 0
@@ -244,6 +267,13 @@ update-check)
     # 只检查不更新，结果写入 update.log 与临时日志文件
     log "=== 更新检查 ==="
     run_updater --check --force || true
+    tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    exit 0
+    ;;
+repair)
+    # 手动修复站点资源（sites 扩展错位/缺失导致后端起不来时）
+    log "=== 修复站点资源 ==="
+    repair_resources
     tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
     exit 0
     ;;
@@ -281,7 +311,7 @@ status)
     exit 3
     ;;
 *)
-    echo "Usage: $0 {start|stop|restart|status|update|update-check|rollback}" > "$TRIM_TEMP_LOGFILE"
+    echo "Usage: $0 {start|stop|restart|status|update|update-check|rollback|repair}" > "$TRIM_TEMP_LOGFILE"
     exit 1
     ;;
 esac
