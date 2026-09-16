@@ -131,8 +131,13 @@ ARCH=arm64 ./build.sh
 仓库已内置 `.github/workflows/build-and-release.yml`，可在 CI 上自动分架构打包：
 
 - **触发方式**：
-  - 手动触发：Actions 页点 `workflow_dispatch`
+  - 手动触发：Actions 页点 `workflow_dispatch`（只构建，不发 Release）
   - 打标签发布：`git tag v1.1.3104 && git push origin v1.1.3104`（自动生成 Release 并附带 changelog）
+- 推分支**不会**触发这个 workflow —— 单架构十几分钟、产物 250 MB，每次提交都跑不划算。
+  推 `master` 或提 PR 时只跑 `lint.yml`（Python/Shell/Node 语法 + manifest 版本一致性，秒级返回）。
+
+> 打 tag 前先确认 `manifest` 的 `version` 已同步改动：CI 会校验 tag 与 manifest 版本一致，
+> 不一致直接失败（避免发出"标题 v1.0.2、附件却是 moviepilot-1.0.1.fpk"的 Release）。
 - **分架构矩阵**：`amd64`（ubuntu-latest）、`arm64`（ubuntu-24.04-arm）
 - **自带运行时**：每个架构的 runner 上执行 `python build.py --with-runtime --arch <arch>`，把该架构的 CPython 3.14 与依赖打进包，安装时**完全无需联网**
 - **产物校验**：打包后会嵌套解开 `app.tgz`，断言 `app/python/bin/python3`、`lib/python3.14/site-packages` 存在，并抽查 `fastapi/uvicorn/sqlalchemy/pydantic_core/orjson` —— 防止再次出现「CI 全绿但包里没有依赖」的静默失败

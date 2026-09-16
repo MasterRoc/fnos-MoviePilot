@@ -1,10 +1,14 @@
 name: Build and Release MoviePilot for fnOS
 
+# 触发说明：
+#   push tags      —— 唯一的"构建并发布"入口。分支推送不触发：单架构要跑十几分钟、
+#                     产物 250 MB 且自带整个 Python 运行时，每次提交都跑纯属浪费配额。
+#   workflow_dispatch —— 手动跑，只构建不发布（release job 有 tag 守卫）。
+# 日常的静态校验（Python/Shell/Node 语法、manifest 版本一致性）走 lint.yml，秒级返回。
+# 这里刻意不再挂 pull_request：PR 由 lint.yml 把关即可，不必拉起两架构的完整打包。
 on:
   push:
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, develop, test ]
   workflow_dispatch:
 
 permissions:
@@ -61,6 +65,19 @@ jobs:
           APP_VERSION=$(grep "^version\s*=" manifest | sed 's/version\s*=\s*//' | tr -d ' ')
           echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
           echo "APP_VERSION=${APP_VERSION}"
+
+      # 产物名、Release 标题与说明全部来自 manifest，只有 tag 来自 git。
+      # 两者一旦不一致（升 tag 忘改 manifest，或反之），会发出"标题 v1.0.2、
+      # 附件却是 moviepilot-1.0.1.fpk"的 Release，而这种错在发布后极难撤销。
+      - name: Verify tag matches manifest version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$TAG" != "$APP_VERSION" ]; then
+            echo "::error::tag v${TAG} 与 manifest version ${APP_VERSION} 不一致"
+            exit 1
+          fi
+          echo "tag 与 manifest 版本一致: v${APP_VERSION}"
 
       - name: Build .fpk (with bundled Python 3.14 runtime)
         # --with-runtime 会：
