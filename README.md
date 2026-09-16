@@ -53,6 +53,7 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 │   ├── bin/
 │   │   ├── gateway-proxy.py     # 网关反向代理（核心）
 │   │   ├── supervisor.py        # 唯一主进程，托管后端/前端/代理
+│   │   ├── mp_updater.py        # 上游自更新器（重启即升级，纯标准库）
 │   │   └── frontend-server.js   # Node 前端服务 + API 代理
 │   ├── mp/                      # MoviePilot V3 源码（build 时下载）
 │   │   └── requirements.lock.txt# 由 uv.lock 导出的锁定依赖清单（在线兜底时用）
@@ -63,7 +64,7 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 │       └── images/              # 入口图标
 ├── cmd/                         # 生命周期脚本
 │   ├── lib.sh                   # 公共函数（运行用户/权限收敛/密码校验/运行时解析）
-│   ├── main                     # start / stop / status
+│   ├── main                     # start / stop / status / update / update-check / rollback
 │   ├── install_init/callback
 │   ├── config_init/callback
 │   ├── upgrade_init/callback
@@ -75,6 +76,8 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 ├── manifest
 ├── build.py                    # 跨平台构建脚本（推荐）
 ├── build.ps1 / build.sh        # 构建脚本（备选）
+├── tools/
+│   └── updater_smoke.py        # 自更新器离线冒烟测试（沙箱，Windows 亦可跑）
 ├── ICON.PNG / ICON_256.PNG
 └── README.md
 ```
@@ -168,6 +171,65 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 可在应用设置中修改端口、重置超级管理员密码。
 
+## 上游自动更新（重启即升级）
+
+上游 MoviePilot 发布新版本时**不需要重新构建 fpk**：应用每次启动（含重启）前会
+自动检查上游 Release，有新版本就下载并就地替换后端源码与前端 dist，然后用新代码启动。
+
+### 为什么不用 MoviePilot 自带的更新功能
+
+上游 V3 确实有 `SystemUpdateManager`（界面里的"检查更新/下载/安装"），但它在 fnOS 上
+三步里断了后两步（v3.0.3 源码核实）：
+
+| 阶段 | 上游实现 | 在 fnOS 包里 |
+|------|----------|--------------|
+| 检查 | 定时任务，受 `MOVIEPILOT_AUTO_UPDATE` 控制（默认关闭，官方注释：只提示、不自动下载安装） | 可用 |
+| 下载 | 界面点"下载"，但非 Docker 时 `_prepare_local_backend_ref()` 要求程序目录是 **git 仓库** | 不可用（fpk 解包无 `.git`） |
+| 安装 | 非 Docker 时 `apply_prepared_update()` 直接返回"当前运行环境不是 Docker"（`is_docker()` 只看 `/.dockerenv`），本地路径还要 `git` + `uv` 重建 venv | 不可用 |
+
+且"重启后应用已下载包"这一步挂在 CLI 的 `start`/`restart` 里，本应用由 supervisor
+直接 `python app/main.py` 启动，压根不经过 CLI。所以改为自研更新器：
+**下载 Release 压缩包 + 目录级替换**，只依赖标准库，不需要 git / uv。
+
+### 工作流程
+
+1. 读本地版本（`mp/version.py`）→ 查 GitHub Release → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
+2. 下载后端 zip → 校验结构（有 `app/`、`version.py` 与 tag 一致）→ 解析出 `FRONTEND_VERSION`
+3. 依赖预检：用新 `uv.lock` 对比已装环境，缺什么补什么（`pip`，走国内镜像）
+4. 备份 → 替换 `app/ config/ database/ scripts/ skills/ moviepilot/` 与 `version.py` 等 → **回填资源包文件**（`app/helper/` 里的 sites 二进制来自独立仓库，上游 zip 里没有）
+5. 前端 dist 整体替换
+6. 自检（关键依赖 import + 源码语法编译），**失败即整树回滚**
+7. 写状态文件，保留最近 2 代备份
+
+另外：如果 MoviePilot 界面已经下载过更新包（`config/temp/movietpilot-update/`），
+更新器会**直接复用**它，不重复下载。
+
+### 开关（`app.env`，也可在应用设置里切换）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `MP_AUTO_UPDATE` | `1` | 总开关，应用设置里有下拉可选 |
+| `MP_UPDATE_CHANNEL` | `release` | `release` 仅正式版 / `prerelease` 含测试版 / `off` 关闭 |
+| `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒），避免每次重启都查 GitHub |
+| `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版本有新增依赖时会**拒绝更新**（避免装出起不来的版本） |
+| `GITHUB_PROXY` | `https://gh-proxy.com/` | 下载加速前缀，直连失败时依次尝试 `gh-proxy` / `ghfast` |
+
+### 手动操作与回退
+
+```bash
+# 立即检查并更新（忽略冷却）；应用运行中会先停后启
+/var/apps/moviepilot/target/cmd/main update
+# 只看有没有新版本，不动任何文件
+/var/apps/moviepilot/target/cmd/main update-check
+# 回滚到更新前的版本（备份在 <应用目录>/.mp-backup/）
+/var/apps/moviepilot/target/cmd/main rollback
+```
+
+更新日志：`TRIM_PKGVAR/update.log`；状态文件：`TRIM_PKGVAR/config/mp_update.json`。
+
+> 注意：通过 fpk 重新安装/升级应用时，应用目录会被整包替换，自更新的内容随之回到
+> 安装包自带的版本（这是预期行为，也让"应用包升级"始终是可靠的回退路径）。
+
 ## 已知假设与限制
 
 - 本包为**原生 Native 应用**。MoviePilot V3 要求 `requires-python >= 3.14`，因此正常产物通过 `--with-runtime` 自带 CPython 3.14 与全部依赖（含 langchain、Rust 扩展等），安装时不联网，也**不需要 fnOS 的 python312**（`manifest` 已不再声明）
@@ -176,9 +238,35 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 - 依赖**优先使用预编译 wheel**，缺失时才源码构建 —— `anitopy`、`pinyin2hanzi` 是纯 Python 的 sdist-only 依赖（PyPI 上无 wheel），禁止构建会直接解析失败，因此不能一刀切 `--no-build`。风险由两道审计兜底：wheel 的 manylinux 基线不得高于 glibc 2.36（fnOS / Debian 12），且凡是本地编译出原生 `.so` 的一律终止构建（它链接的是构建机的 glibc 2.39）
 - 产物体积较大（自带解释器 + 全部依赖），预期在数百 MB 量级；这是「安装时零联网」的代价
 - MoviePilot 的插件依赖是在运行时用自身解释器的 pip 安装到 `app/python/` 的 `site-packages`。**升级会整包替换应用目录，插件依赖需要重新安装**
+- 自更新只替换后端源码与前端静态文件，不替换自带 Python 运行时（`app/python/`）；新版本引入新依赖时由更新器用 pip 增量补装（需要联网，走国内镜像）
+- 自更新要求应用目录可写（`TRIM_APPDEST`）。目录只读时会跳过更新并记日志，此时只能通过重新安装应用包升级
 - 默认使用 **SQLite**；如需 PostgreSQL，可在 `app.env` 中设置 `DB_TYPE=postgresql` 并配置连接（需 fnOS 安装 PostgreSQL）
 - 后端源码、前端产物、自带 Python 运行时、fnpack 工具、下载缓存等**所有构建产物全部收敛在 `.local-build/`，不纳入 git**，由构建脚本生成；拉取仓库后需先执行构建脚本，项目根目录不残留任何构建产物
 - 首个登录使用安装向导设置的管理员账号
+
+## 故障排查
+
+### 启动后短暂 502 / 提示"后端服务启动中"
+
+通常不是故障。MoviePilot 后端（uvicorn）**先跑完 lifespan 才 bind 监听端口**，
+而建库与迁移、插件安装、调度器启动都在这一步之前，首次启动可能要几十秒到几分钟。
+在这段时间里前端静态页已经能正常打开，但对 `/api` 的转发必然拿不到连接。
+
+前端内置了**就绪门**：`/api` 请求会挂起等待后端就绪（默认最多 180 秒，可用
+`MP_BACKEND_WAIT_TIMEOUT` 环境变量调整），后端可连接后原样转发；超时才返回
+`503` + `Retry-After: 10`，由页面自行重试。所以正常表现是"页面先出来、数据稍后到"，
+而不是刷一串 502。
+
+### 后端真的起不来时看哪里
+
+| 日志 | 内容 |
+|------|------|
+| `TRIM_PKGVAR/backend.log` | 后端进程 stdio，含 import 阶段崩溃的回溯（缺依赖、Python 版本不符等只会落在这里） |
+| `TRIM_PKGVAR/moviepilot.log` | 主管进程日志；后端异常退出时会带上退出码与 `backend.log` 末尾 30 行 |
+| `TRIM_PKGVAR/config/logs/moviepilot.log` | MoviePilot 自己的应用日志 |
+
+主管进程还会把"进程已启动"与"端口已可服务"分开记录（`后端已就绪：127.0.0.1:3002 可连接`），
+只有后者出现才代表后端真正开始对外服务。
 
 ## 免责声明
 

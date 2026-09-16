@@ -18,11 +18,18 @@
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
+const net = require("net");
 
 const FRONTEND_DIR = process.env.MP_FRONTEND_DIR;
 const BACKEND_HOST = process.env.MP_BACKEND_HOST || "127.0.0.1";
 const BACKEND_PORT = parseInt(process.env.MP_BACKEND_PORT || "3001", 10);
 const FRONTEND_PORT = parseInt(process.env.MP_FRONTEND_PORT || "3000", 10);
+// 后端启动等待上限：uvicorn 要跑完 lifespan（建库/迁移、插件安装、调度器启动）
+// 才 bind 端口，首次启动可能耗时数分钟，必须留足预算。
+const BACKEND_WAIT_TIMEOUT = Math.max(
+  0,
+  parseInt(process.env.MP_BACKEND_WAIT_TIMEOUT || "180000", 10) || 180000
+);
 
 if (!FRONTEND_DIR) {
   console.error("[moviepilot-frontend] MP_FRONTEND_DIR is not set");
@@ -111,6 +118,113 @@ function rewriteMockServer(pathname) {
 // 自动重试一次，避免前端健康检查（如 system/ping）偶发失败误报"正在重新连接"。
 const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
+// ---------------------------------------------------------------------------
+// 后端就绪门（启动预热）
+// ---------------------------------------------------------------------------
+// uvicorn 先跑完 lifespan 再 bind 监听端口，而建库/迁移、插件安装、调度器启动
+// 都在 lifespan 里。因此"后端进程已存在"与"后端端口可连接"之间可能隔着几十秒
+// 到几分钟。这段窗口里前端静态页本来是能正常打开的，但对 /api 的转发会立刻
+// ECONNREFUSED —— 早期实现直接回 502，用户在浏览器里看到的是 "Bad Gateway"
+// 而不是 MoviePilot 的加载界面，还会在日志里刷出一串 502。
+//
+// 改为：转发前先探测后端端口，未就绪就把请求挂起（此时还没消费请求体，
+// 可以安全地原样重放），等后端可连接再真正发起；超过 MP_BACKEND_WAIT_TIMEOUT
+// 才放行一个带 Retry-After 的 503，由前端自行重试。
+let backendReady = false;
+let backendProbing = false;
+let backendWaiters = [];
+
+function probeBackendOnce() {
+  return new Promise((resolve) => {
+    let settled = false;
+    let sock = null;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { if (sock) sock.destroy(); } catch (e) { /* ignore */ }
+      resolve(ok);
+    };
+    try {
+      sock = net.createConnection({ host: BACKEND_HOST, port: BACKEND_PORT });
+    } catch (e) {
+      finish(false);
+      return;
+    }
+    sock.setTimeout(5000);
+    sock.once("connect", () => finish(true));
+    sock.once("error", () => finish(false));
+    sock.once("timeout", () => finish(false));
+  });
+}
+
+// 后端进程在运行但连不上：多半是刚被重启/刚崩溃，回退到等待模式。
+function markBackendDown(reason) {
+  if (backendReady) {
+    console.error("[moviepilot-frontend] 后端连接中断，进入等待模式: " + reason);
+  }
+  backendReady = false;
+}
+
+// 所有等待者共用一个探测循环，避免 N 个并发请求各起一个定时器把后端打爆。
+function ensureBackend(cb) {
+  if (backendReady) {
+    cb(true);
+    return;
+  }
+  backendWaiters.push(cb);
+  if (backendProbing) return;
+  backendProbing = true;
+
+  const startedAt = Date.now();
+  const deadline = startedAt + BACKEND_WAIT_TIMEOUT;
+  let hinted = false;
+  console.error(
+    "[moviepilot-frontend] 后端 " + BACKEND_HOST + ":" + BACKEND_PORT +
+    " 尚未就绪，最多等待 " + Math.round(BACKEND_WAIT_TIMEOUT / 1000) + "s"
+  );
+
+  (function tick() {
+    probeBackendOnce().then((ok) => {
+      if (ok) {
+        backendReady = true;
+      }
+      const elapsed = Date.now() - startedAt;
+      if (backendReady) {
+        console.error(
+          "[moviepilot-frontend] 后端已就绪（等待 " + (elapsed / 1000).toFixed(1) + "s）"
+        );
+      } else if (Date.now() >= deadline) {
+        console.error("[moviepilot-frontend] 等待后端就绪超时（" +
+          Math.round(BACKEND_WAIT_TIMEOUT / 1000) + "s）");
+      } else {
+        if (!hinted && elapsed > 15000) {
+          hinted = true;
+          console.error(
+            "[moviepilot-frontend] 后端仍在启动中（uvicorn 需先完成 lifespan 才监听端口）"
+          );
+        }
+        setTimeout(tick, 1000);
+        return;
+      }
+      backendProbing = false;
+      const waiters = backendWaiters;
+      backendWaiters = [];
+      for (let i = 0; i < waiters.length; i++) {
+        try { waiters[i](backendReady); } catch (e) { /* ignore */ }
+      }
+    });
+  })();
+}
+
+function writeBackendUnavailable(res) {
+  res.writeHead(503, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Retry-After": "10",
+  });
+  res.end(JSON.stringify({ detail: "后端服务启动中，请稍后重试" }));
+}
+
 function proxyRequest(req, res, pathname, retried) {
   // 与官方 nginx 对齐的 mock-server 路径重写（CookieCloud 客户端场景）
   pathname = rewriteMockServer(pathname);
@@ -180,21 +294,37 @@ function proxyRequest(req, res, pathname, retried) {
 
   proxy.on("error", (err) => {
     console.error("[moviepilot-frontend] proxy error:", err.message);
-    if (!res.headersSent) {
-      // 幂等请求的连接级错误（ECONNRESET/EPIPE/ETIMEDOUT 等，通常源于后端
-      // uvicorn 的短 keep-alive 超时静默关闭了复用连接），重试一次即可成功，
-      // 避免后端轻微抖动被放大为前端连接状态误判。
-      if (!retried && IDEMPOTENT_METHODS.has(req.method)) {
-        console.error("[moviepilot-frontend] retrying once:", req.method, pathname);
-        try { proxy.destroy(); } catch (e) {}
-        proxyRequest(req, res, pathname, true);
-        return;
-      }
-      res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Bad Gateway: backend not reachable");
-    } else {
-      res.end();
+    if (res.headersSent) {
+      try { res.end(); } catch (e) {}
+      return;
     }
+    try { proxy.destroy(); } catch (e) {}
+
+    // ECONNREFUSED 说明后端还没监听（启动窗口）或刚被重启，不能当普通抖动处理
+    // ——必须回退到等待模式，否则下一秒进来的每个请求都会再吃一次失败。
+    const refused = err.code === "ECONNREFUSED";
+    if (refused) markBackendDown(err.code);
+
+    // 幂等请求可以安全重放（ECONNRESET/EPIPE 等多半是 keep-alive 连接被对端
+    // 静默关闭）；非幂等请求体已经发出，重放有副作用，只能报错。
+    if (!retried && IDEMPOTENT_METHODS.has(req.method)) {
+      console.error("[moviepilot-frontend] retrying once:", req.method, pathname);
+      if (refused) {
+        ensureBackend((ok) => {
+          if (ok) proxyRequest(req, res, pathname, true);
+          else writeBackendUnavailable(res);
+        });
+      } else {
+        proxyRequest(req, res, pathname, true);
+      }
+      return;
+    }
+    if (refused) {
+      writeBackendUnavailable(res);
+      return;
+    }
+    res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Bad Gateway: backend not reachable");
   });
 
   // 防止 req 读取出错导致崩溃
@@ -291,13 +421,30 @@ function writeRawResponse(socket, res) {
   socket.write(lines.join("\r\n") + "\r\n\r\n");
 }
 
+// WebSocket 握手同样要过就绪门：后端启动窗口内握手必然失败，前端会进入
+// 无限静默重连。这里与 HTTP 路径共用同一个等待逻辑。
 function proxyUpgrade(req, socket, head) {
   const pathname = (req.url || "/").split("?")[0];
   if (!isProxyPath(pathname)) {
     socket.destroy();
     return;
   }
+  ensureBackend((ok) => {
+    if (!ok) {
+      try {
+        socket.write(
+          "HTTP/1.1 503 Service Unavailable\r\n" +
+          "Connection: close\r\nRetry-After: 10\r\nContent-Length: 0\r\n\r\n"
+        );
+      } catch (e) { /* ignore */ }
+      socket.destroy();
+      return;
+    }
+    doProxyUpgrade(req, socket, head);
+  });
+}
 
+function doProxyUpgrade(req, socket, head) {
   // 原样透传客户端头（含 Sec-WebSocket-* 与 Cookie/Authorization），
   // 仅替换 host；Connection/Upgrade 必须保留，否则后端不会返回 101。
   const headers = Object.assign({}, req.headers, {
@@ -357,9 +504,18 @@ function proxyUpgrade(req, socket, head) {
 const server = http.createServer((req, res) => {
   const pathname = req.url.split("?")[0];
 
-  // API 与 CookieCloud 代理到后端
+  // API 与 CookieCloud 代理到后端（先等后端就绪，见"后端就绪门"注释）
   if (isProxyPath(pathname)) {
-    proxyRequest(req, res, pathname);
+    ensureBackend((ok) => {
+      // 等待期间用户可能已经刷新或关闭页面：此时响应已销毁，再写会触发
+      // ERR_STREAM_DESTROYED，必须直接放弃。
+      if (res.writableEnded || res.destroyed) return;
+      if (!ok) {
+        writeBackendUnavailable(res);
+        return;
+      }
+      proxyRequest(req, res, pathname, false);
+    });
     return;
   }
 
@@ -385,6 +541,10 @@ server.on("error", (err) => {
 // 导致 "request failed, retry fresh: ... Remote end closed connection without response"。
 server.keepAliveTimeout = 60000;
 server.headersTimeout = 61000;
+// 就绪门会把请求挂起最长 BACKEND_WAIT_TIMEOUT。Node 18+ 的 requestTimeout
+// 默认 300s，与等待时间叠加后可能在等待期间主动回 408 并断开连接，
+// 表现为"后端还没起来请求就已经失败"。这里显式放宽到等待预算之上。
+server.requestTimeout = BACKEND_WAIT_TIMEOUT + 120000;
 
 server.listen(FRONTEND_PORT, "127.0.0.1", () => {
   console.log(`[moviepilot-frontend] serving ${FRONTEND_DIR} on 127.0.0.1:${FRONTEND_PORT}`);

@@ -17,6 +17,16 @@
         "rules": [
           { "pattern": "^[0-9]+$", "message": "请输入数字端口" }
         ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_auto_update",
+        "label": "上游自动更新（应用重启时自动升级 MoviePilot，无需重装应用包）",
+        "initValue": "1",
+        "options": [
+          { "label": "开启（推荐）", "value": "1" },
+          { "label": "关闭", "value": "0" }
+        ]
       }
     ]
   },

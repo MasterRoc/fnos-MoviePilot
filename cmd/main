@@ -45,6 +45,8 @@ SUPERVISOR="${BIN_DIR}/supervisor.py"
 SUPER_PID_FILE="${TRIM_PKGTMP}/${APP_NAME}-super.pid"
 LOG_FILE="${TRIM_PKGVAR}/${APP_NAME}.log"
 GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
+MP_UPDATER="${BIN_DIR}/mp_updater.py"
+UPDATE_LOG="${TRIM_PKGVAR}/update.log"
 
 # 共享目录（用于写诊断日志，trim-cli 可读取）；未导出时跳过共享日志
 SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
@@ -108,6 +110,45 @@ get_super_pid() {
 is_running() {
     p=$(get_super_pid)
     [ -n "$p" ]
+}
+
+# ---------------------------------------------------------------------------
+# 自更新：启动前检查上游 Release 并就地升级
+# ---------------------------------------------------------------------------
+# 上游发新版本时无需重新构建 fpk —— mp_updater.py 会下载新版后端源码与前端
+# dist 就地替换，随后本脚本照常用新代码启动。更新失败一律不影响启动：
+# 更新器内部已回滚，这里只记录退出码。
+#   --auto  ：遵守 app.env 的 MP_AUTO_UPDATE 开关与检查冷却（启动路径用）
+#   --force ：忽略开关与冷却（手动 update 子命令用）
+# 退出码：0 无需更新 / 10 已更新 / 124 超时 / 其它 失败
+run_updater() {
+    [ -f "$MP_UPDATER" ] || { log "跳过更新检查：缺少 ${MP_UPDATER}"; return 0; }
+    [ -x "$APP_PYTHON" ] || { log "跳过更新检查：Python 运行时不存在（${APP_PYTHON}）"; return 0; }
+    mkdir -p "${TRIM_PKGTMP}"
+    export MP_SRC FRONTEND_DIR CONFIG_DIR APP_PYTHON TRIM_PKGTMP SHARE_LOG
+    export MP_UPDATE_LOG="$UPDATE_LOG"
+    local rc=0
+    log "==> 检查上游更新（$*）"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${MP_UPDATE_TIMEOUT:-600}" "$APP_PYTHON" "$MP_UPDATER" "$@" \
+            >> "$UPDATE_LOG" 2>&1 || rc=$?
+    else
+        # 没有 coreutils timeout 时直接跑（更新器自身对各步都有超时）
+        "$APP_PYTHON" "$MP_UPDATER" "$@" >> "$UPDATE_LOG" 2>&1 || rc=$?
+    fi
+    case "$rc" in
+        0)   log "==> 无需更新" ;;
+        10)  log "==> 已应用上游更新，修正运行时权限"
+             # pip 以 root 身份补装过依赖，把 site-packages/bin 交还应用运行用户，
+             # 否则 MoviePilot 运行时安装插件依赖会 PermissionError
+             if command -v mp_runtime_dir >/dev/null 2>&1; then
+                 mp_secure_venv "$(mp_runtime_dir 2>/dev/null || echo "${VENV_DIR}")" 2>/dev/null || true
+             fi
+             ;;
+        124) log "==> 更新检查超时（${MP_UPDATE_TIMEOUT:-600}s），继续使用当前版本" ;;
+        *)   log "==> 更新检查未完成（rc=$rc），继续使用当前版本" ;;
+    esac
+    return $rc
 }
 
 start_app() {
@@ -175,8 +216,51 @@ rotate_logs
 case "${1:-}" in
 start)
     log "=== start ==="
+    # 重启即升级：只在真正需要时才会下载（有版本才联网），失败不影响启动。
+    if [ "${MP_SKIP_UPDATE:-}" != "1" ]; then
+        run_updater --auto || true
+    fi
     start_app || exit 1
     log "=== started ==="
+    exit 0
+    ;;
+update)
+    # 手动立即更新（忽略冷却）：供 trim-cli / 命令行排查使用，fnOS 不会主动调用
+    log "=== 手动更新 ==="
+    was_running=0
+    if is_running; then
+        was_running=1
+        "$0" stop
+        sleep 2
+    fi
+    run_updater --force || true
+    tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    if [ "$was_running" = "1" ]; then
+        "$0" start
+    fi
+    exit 0
+    ;;
+update-check)
+    # 只检查不更新，结果写入 update.log 与临时日志文件
+    log "=== 更新检查 ==="
+    run_updater --check --force || true
+    tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    exit 0
+    ;;
+rollback)
+    # 回滚到最近一次更新前的备份（更新后启动异常时的逃生通道）
+    log "=== 回滚更新 ==="
+    was_running=0
+    if is_running; then
+        was_running=1
+        "$0" stop
+        sleep 2
+    fi
+    run_updater --rollback || true
+    tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    if [ "$was_running" = "1" ]; then
+        "$0" start
+    fi
     exit 0
     ;;
 stop)
@@ -197,7 +281,7 @@ status)
     exit 3
     ;;
 *)
-    echo "Usage: $0 {start|stop|restart|status}" > "$TRIM_TEMP_LOGFILE"
+    echo "Usage: $0 {start|stop|restart|status|update|update-check|rollback}" > "$TRIM_TEMP_LOGFILE"
     exit 1
     ;;
 esac

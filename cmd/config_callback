@@ -66,6 +66,24 @@ if [ -n "${wizard_nginx_port:-}" ]; then
     fi
 fi
 
+# 自更新开关（向导 select：1=开启 / 0=关闭）
+if [ -n "${wizard_auto_update:-}" ]; then
+    case "${wizard_auto_update}" in
+        0|1) MP_AUTO_UPDATE_VALUE="${wizard_auto_update}" ;;
+        *)   MP_AUTO_UPDATE_VALUE="1" ;;   # 非预期值一律按开启处理，避免误关
+    esac
+    if grep -q '^MP_AUTO_UPDATE=' "${ENV_FILE}" 2>/dev/null; then
+        sed -i "s/^MP_AUTO_UPDATE=.*/MP_AUTO_UPDATE=${MP_AUTO_UPDATE_VALUE}/" "${ENV_FILE}"
+    else
+        echo "MP_AUTO_UPDATE=${MP_AUTO_UPDATE_VALUE}" >> "${ENV_FILE}"
+    fi
+fi
+# 补齐其它更新相关默认值（旧版本安装的 app.env 没有这些键）
+mp_env_ensure "${ENV_FILE}" "MP_AUTO_UPDATE" "1"
+mp_env_ensure "${ENV_FILE}" "MP_UPDATE_CHANNEL" "release"
+mp_env_ensure "${ENV_FILE}" "MP_UPDATE_INTERVAL" "21600"
+mp_env_ensure "${ENV_FILE}" "MP_UPDATE_DEPS" "1"
+
 # 更新超级管理员密码（如向导要求修改）
 if [ -n "${wizard_superuser_password:-}" ]; then
     if grep -q '^SUPERUSER_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then

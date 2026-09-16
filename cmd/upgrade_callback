@@ -56,6 +56,13 @@ mp_secure_config "${CONFIG_DIR}" "${CONFIG_DIR}/app.env" 1 || {
     fi
 }
 
+# 补齐新增功能的默认值：app.env 只在安装时生成一次，旧版本装的应用升级上来后
+# 不会自动带上这些键。mp_env_ensure 只补缺失项，用户改过的配置不受影响。
+mp_env_ensure "${CONFIG_DIR}/app.env" "MP_AUTO_UPDATE" "1"
+mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_CHANNEL" "release"
+mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_INTERVAL" "21600"
+mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_DEPS" "1"
+
 # venv 不存在时先创建：从"内嵌运行时"的包升级到"在线安装"的包时，VENV_DIR 会
 # 指向从未创建过的 ${TRIM_PKGVAR}/venv，后续 pip 调用会让所有镜像源都失败并
 # 中断升级。自带运行时（RUNTIME_BUNDLED=1）自带解释器，无需建 venv。

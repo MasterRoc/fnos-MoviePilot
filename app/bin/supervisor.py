@@ -38,6 +38,15 @@ GATEWAY_SOCK = os.environ.get("GATEWAY_SOCK", "")
 LOG_FILE = os.environ.get("LOG_FILE", "")
 SHARE_LOG = os.environ.get("SHARE_LOG", "")
 PYTHON_BIN = os.environ.get("PYTHON_BIN", "python3")
+BACKEND_HOST = os.environ.get("BACKEND_HOST", "127.0.0.1")
+
+# 后端 stdio 单独落盘。早期实现把后端 stdout 直接丢给 DEVNULL，导致后端一旦在
+# import 阶段崩溃（缺依赖、Python 版本不符、权限问题）就完全没有线索可查，
+# 只能看到前端不断刷 502 —— 而这恰恰是最需要日志的场景。
+BACKEND_LOG = os.environ.get("BACKEND_LOG", "")
+if not BACKEND_LOG and LOG_FILE:
+    BACKEND_LOG = os.path.join(os.path.dirname(LOG_FILE) or ".", "backend.log")
+BACKEND_LOG_MAX = 8 * 1024 * 1024
 
 
 def log(msg):
@@ -83,15 +92,103 @@ def _out():
     return subprocess.DEVNULL
 
 
-def _backend_out():
-    """后端 stdout 目标。
+def _rotate_backend_log():
+    """后端日志超过上限时轮转一次。
 
-    后端(MoviePilot)会自己把应用日志和 stdio 日志分别写入
-    config/logs/moviepilot.log 和 config/logs/moviepilot.stdout.log，
-    因此这里丢弃后端的 stdout，避免在顶层 moviepilot.log 重复记录。
-    前端与网关无独立日志文件，仍写入顶层 LOG_FILE（见 _out）。
+    只在每次（重新）启动后端时检查：后端重启次数有限，这里的开销可以忽略；
+    而 MoviePilot 的崩溃回溯可能很长，必须留够空间。
     """
-    return subprocess.DEVNULL
+    try:
+        if os.path.getsize(BACKEND_LOG) < BACKEND_LOG_MAX:
+            return
+    except OSError:
+        return
+    old = _LOG_HANDLES.pop(BACKEND_LOG, None)
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+    try:
+        os.replace(BACKEND_LOG, BACKEND_LOG + ".1")
+    except OSError:
+        pass
+
+
+def _backend_out():
+    """后端 stdout 目标：独立文件 backend.log。
+
+    后端(MoviePilot)会自己把应用日志写入 config/logs/moviepilot.log，
+    但那要求它已经跑过配置加载；启动早期的 ImportError / 语法错误 / 缺 .so
+    只会落在 stdio 上。这里单独接住，避免与顶层 moviepilot.log 混在一起，
+    也让"后端已启动"与"后端已可服务"两件事能被区分记录。
+    """
+    if not BACKEND_LOG:
+        return subprocess.DEVNULL
+    _rotate_backend_log()
+    handle = _LOG_HANDLES.get(BACKEND_LOG)
+    if handle is not None and not handle.closed:
+        return handle
+    try:
+        handle = open(BACKEND_LOG, "a", encoding="utf-8", errors="replace")
+    except Exception:
+        return subprocess.DEVNULL
+    _LOG_HANDLES[BACKEND_LOG] = handle
+    return handle
+
+
+def _dump_backend_log_tail(lines=30):
+    """把后端日志末尾转存到主日志，排查时无需再另开文件。"""
+    if not BACKEND_LOG or not os.path.exists(BACKEND_LOG):
+        return
+    try:
+        with open(BACKEND_LOG, "r", encoding="utf-8", errors="replace") as fp:
+            tail = fp.readlines()[-lines:]
+    except OSError:
+        return
+    if not tail:
+        return
+    log("---- 后端日志末尾 ----")
+    for line in tail:
+        log(line.rstrip("\n"))
+    log("---- 后端日志结束 ----")
+
+
+def _port_open(host, port, timeout=1.0):
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _watch_backend_ready(proc):
+    """后台线程：等待后端真正监听端口并记录耗时。
+
+    uvicorn 的监听端口是在 lifespan 全部完成之后才 bind 的（建库/迁移、插件
+    安装、调度器启动都在那之前），首次启动可能要几十秒到几分钟。期间前端转发
+    必然 ECONNREFUSED。这里只做可观测性：把"进程已启动"和"端口已可服务"分开
+    记录，并在迟迟未就绪时周期性告警，避免把启动慢误判成启动失败。
+    """
+    port = int(BACKEND_PORT)
+    started = time.time()
+    deadline = started + 900
+    next_warn = started + 30
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return
+        if _port_open(BACKEND_HOST, port):
+            log("后端已就绪：%s:%s 可连接（启动耗时 %.1fs）"
+                % (BACKEND_HOST, port, time.time() - started))
+            return
+        now = time.time()
+        if now >= next_warn:
+            log("后端进程存活但尚未监听 %s:%s（已等待 %.0fs，uvicorn 需先完成 "
+                "lifespan 才 bind 端口）" % (BACKEND_HOST, port, now - started))
+            next_warn = now + 60
+        time.sleep(2)
+    log("警告：后端启动超过 900s 仍未监听 %s:%s" % (BACKEND_HOST, port))
 
 
 def _cleanup_stale_backend():
@@ -227,7 +324,9 @@ def start_backend():
             stdout=_backend_out(),
             stderr=subprocess.STDOUT,
         )
-        log(f"后端已启动 pid={proc.pid}")
+        log(f"后端已启动 pid={proc.pid}（stdio -> {BACKEND_LOG or 'DEVNULL'}）")
+        threading.Thread(target=_watch_backend_ready, args=(proc,),
+                         daemon=True).start()
         return proc
     except Exception as e:
         log(f"后端启动异常: {e}\n{traceback.format_exc()}")
@@ -312,7 +411,9 @@ class Services:
                 return
             if self.backend is None or self.backend.poll() is not None:
                 if self.backend is not None:
-                    log("后端已退出，尝试重启")
+                    # 带上退出码与日志末尾：没有这两样，"后端反复重启"就只能靠猜
+                    log(f"后端已退出（退出码 {self.backend.returncode}），尝试重启")
+                    _dump_backend_log_tail()
                 self.backend = start_backend()
             if self.frontend is None or self.frontend.poll() is not None:
                 if self.frontend is not None:

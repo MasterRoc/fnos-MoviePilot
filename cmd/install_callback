@@ -71,6 +71,14 @@ SUPERUSER=${wizard_superuser:-admin}
 SUPERUSER_PASSWORD=${wizard_superuser_password}
 # GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时
 GITHUB_PROXY=https://gh-proxy.com/
+# 自动更新：应用每次启动（重启）前检查上游 Release 并就地升级，无需重新构建安装包
+MP_AUTO_UPDATE=1
+# 更新通道：release=仅正式版 / prerelease=含测试版 / off=关闭
+MP_UPDATE_CHANNEL=release
+# 检查间隔（秒）：避免每次重启都去查一次 GitHub
+MP_UPDATE_INTERVAL=21600
+# 是否顺带同步 Python 依赖：新版本引入新依赖时必须开启
+MP_UPDATE_DEPS=1
 EOF
 
 log "app.env 已生成：${ENV_FILE}"
