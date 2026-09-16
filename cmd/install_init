@@ -5,14 +5,15 @@
 ###       修改规则时请同步 cmd/lib.sh 的 mp_validate_password。
 set -u
 
-PYTHON_BIN="/var/apps/python312/target/bin/python3"
 NODE_BIN="/var/apps/nodejs_v24/target/bin"
 
-# 检查依赖运行时是否存在
-if [ ! -x "$PYTHON_BIN" ]; then
-    echo "缺少 Python 3.12 运行时（依赖 python312 未安装）" > "$TRIM_TEMP_LOGFILE"
-    exit 1
-fi
+# 检查依赖运行时是否存在。
+# 这里**不检查** fnOS 的 python312：本应用自带 CPython 3.14 运行时（app/python），
+# 根本用不上它，manifest 的 install_dep_apps 也已不再声明 python312 —— 否则用户
+# 会被强制安装一个完全用不到的运行时。
+# 注意本脚本运行在"包未解压"阶段，无法判断包里是否真的带了运行时，所以这里只能
+# 无条件放行；万一装的是未打包运行时的降级包，install_callback 阶段会用
+# fnOS python312 兜底并在失败时给出明确报错。
 if [ ! -x "$NODE_BIN/node" ]; then
     echo "缺少 Node.js 运行时（依赖 nodejs_v24 未安装）" > "$TRIM_TEMP_LOGFILE"
     exit 1

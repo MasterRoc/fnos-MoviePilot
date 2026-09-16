@@ -17,8 +17,8 @@
 | 后端 | MoviePilot V3（FastAPI + Python 3.14），监听 `127.0.0.1:3002` |
 | 前端 | MoviePilot-Frontend（Vue3 预编译 `dist.zip`），Express 静态服务监听 `127.0.0.1:3005`，并代理 `/api`、`/cookiecloud` 到后端 |
 | 网关代理 | `app/bin/gateway-proxy.py`，Unix Socket → 前端端口，完成前缀剥离、JS polyfill、WebSocket 隧道 |
-| Python 运行时 | **自带 CPython 3.14.7**（python-build-standalone，随包分发，安装时不联网）；fnOS 应用中心的 `python312` 仅作在线兜底 |
-| Node 运行时 | fnOS `nodejs_v24`（`manifest` 的 `install_dep_apps` 声明依赖） |
+| Python 运行时 | **自带 CPython 3.14.7**（python-build-standalone，随包分发，安装时不联网）。`manifest` 已不再声明 fnOS 的 `python312` —— 版本不够且用不上，无需安装 |
+| Node 运行时 | fnOS `nodejs_v24`（`manifest` 的 `install_dep_apps` 声明依赖，前端静态服务需要） |
 | 数据库 | SQLite（默认），配置存于 `TRIM_PKGVAR/config` |
 
 ```
@@ -154,7 +154,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 2. 初始化 SQLite 数据库并创建超级管理员
 
 > - **构建时用了 `--with-runtime`**（CI 产物即如此）：安装时完全不联网，开箱即用。安装脚本会先自检解释器与核心依赖，不自检通过就明确失败，不会留下「安装成功但起不来」的应用。
-> - **未用 `--with-runtime`**（如 Windows 构建）：安装时用 fnOS `python312` 建 venv 并 `pip install` 依赖（走国内加速源），需 NAS 联网，首次安装可能耗时数分钟。注意此路径下依赖需满足 `requires-python >= 3.14`，实际很可能装不上，仅作降级兜底。
+> - **未用 `--with-runtime`**（如 Windows 本地构建）：安装时尝试用 fnOS `python312` 建 venv 并 `pip install` 依赖（走国内加速源）。但 `manifest` 已不再声明 `python312`，且依赖要求 `requires-python >= 3.14`，这条路径实际上装不上 —— 它只是给本地开发留的降级分支，**请使用 CI 产物或 Linux/macOS 上带 `--with-runtime` 构建**。
 
 ## 使用
 
@@ -170,7 +170,8 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 ## 已知假设与限制
 
-- 本包为**原生 Native 应用**。MoviePilot V3 要求 `requires-python >= 3.14`，因此正常产物通过 `--with-runtime` 自带 CPython 3.14 与全部依赖（含 langchain、Rust 扩展等），安装时不联网；未打包运行时的产物只能退回 fnOS `python312` 在线安装依赖
+- 本包为**原生 Native 应用**。MoviePilot V3 要求 `requires-python >= 3.14`，因此正常产物通过 `--with-runtime` 自带 CPython 3.14 与全部依赖（含 langchain、Rust 扩展等），安装时不联网，也**不需要 fnOS 的 python312**（`manifest` 已不再声明）
+- Node.js（`nodejs_v24`）是唯一仍需 fnOS 提供的运行时，用于前端静态服务
 - `--with-runtime` 需要在 **Linux/macOS** 构建机上执行（Windows 无法交叉准备 Linux 运行时）；且构建机架构需与目标 NAS 架构一致（amd64/arm64 分开构建，CI 用对应的原生 runner）
 - 依赖**优先使用预编译 wheel**，缺失时才源码构建 —— `anitopy`、`pinyin2hanzi` 是纯 Python 的 sdist-only 依赖（PyPI 上无 wheel），禁止构建会直接解析失败，因此不能一刀切 `--no-build`。风险由两道审计兜底：wheel 的 manylinux 基线不得高于 glibc 2.36（fnOS / Debian 12），且凡是本地编译出原生 `.so` 的一律终止构建（它链接的是构建机的 glibc 2.39）
 - 产物体积较大（自带解释器 + 全部依赖），预期在数百 MB 量级；这是「安装时零联网」的代价

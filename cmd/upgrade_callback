@@ -150,8 +150,17 @@ fi
 if [ -x "${PYTHON}" ] && [ -d "${MP_SRC}" ]; then
     (
         cd "${MP_SRC}" && \
-        CONFIG_DIR="${CONFIG_DIR}" "${PYTHON}" \
-            -c "from app.db.init import init_db, update_db; init_db(); update_db()"
+        CONFIG_DIR="${CONFIG_DIR}" "${PYTHON}" -c "
+try:
+    # V3 官方入口：先校验 revision 链，必要时先迁移再建表，避免旧库 create_all 冲突
+    from app.startup.initializers.database import prepare_database
+except ImportError:
+    from app.db.init import init_db, update_db
+    init_db()
+    update_db()
+else:
+    prepare_database()
+"
     ) >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 || true
 fi
 

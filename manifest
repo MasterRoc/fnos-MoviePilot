@@ -25,7 +25,10 @@ desktop_uidir         = ui
 desktop_applaunchname = moviepilot.Application
 
 # 依赖运行时
-install_dep_apps      = python312:nodejs_v24
+# 不声明 python312：本应用自带 CPython 3.14 运行时（app/python，构建时打包），
+# MoviePilot V3 要求 requires-python >= 3.14，fnOS 的 python312 版本不够也用不上。
+# 只需要 Node.js 跑前端静态服务。
+install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v1.0.0<br>1.初始版本
+changelog             = v1.0.0<br>1.初始版本：自带 CPython 3.14 运行时，内置 MoviePilot V3 后端与前端<br>2.修复安装/修改配置时超级管理员初始化失败（V3 事务执行器未登记导致的“同步事务执行器尚未配置”）<br>3.数据库初始化改用官方 prepare_database，升级时先迁移再建表<br>4.修复已存在管理员账号时同步密码导致安装中断

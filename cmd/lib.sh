@@ -131,6 +131,8 @@ mp_validate_password() {
 #       -- "$0")")/python3.14"` 这种相对路径 trampoline（并非构建机绝对路径
 #       shebang，是可重定位的），但它依赖系统存在 realpath；用 -m pip 可以少
 #       依赖一个外部命令，且对 venv 与自带运行时两种布局都成立。
+# manifest 已不再声明 python312（本应用自带 CPython 3.14），这里只为"未打包运行时
+# 的降级包"留一条在线兜底路径。正常安装用不到。
 MP_FNOS_PYTHON="/var/apps/python312/target/bin/python3"
 
 mp_runtime_dir() {

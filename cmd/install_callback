@@ -1,7 +1,9 @@
 #!/bin/bash
 ### MoviePilot 安装后初始化
 ### 运行时：优先用构建时打包的自带 Python 3.14（app/python，含全部依赖，安装时无需联网）；
-###         缺失时退回 fnOS python312 + nodejs_v24，在线创建 venv 并安装依赖。
+###         缺失时（仅可能出现在本地未加 --with-runtime 构建的降级包）退回 fnOS
+###         python312 在线建 venv。注意 manifest 已不再声明 python312，正常安装
+###         路径用不到它。
 set -u
 
 NODE_BIN="/var/apps/nodejs_v24/target/bin"
