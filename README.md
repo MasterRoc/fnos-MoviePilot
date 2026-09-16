@@ -94,8 +94,8 @@ python build.py --skip-mp           # 跳过下载后端源码
 python build.py --skip-fe           # 跳过下载前端
 python build.py --arch arm64        # 显式声明目标架构（裁剪 sites 原生变体）
 python build.py --with-runtime      # 自带 Python 3.14 运行时 + 全部依赖（安装时完全不联网，仅 Linux/macOS）
-python build.py --with-runtime --allow-build
-                                    # 同上，但允许从源码构建依赖（默认只用预编译 wheel）
+python build.py --with-runtime --no-build
+                                    # 严格模式：禁止源码构建，只用预编译 wheel
 ```
 
 > `--with-venv` 仍可用，是 `--with-runtime` 的兼容别名（早期版本打包的是 venv，现已改为自带解释器）。
@@ -172,7 +172,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 - 本包为**原生 Native 应用**。MoviePilot V3 要求 `requires-python >= 3.14`，因此正常产物通过 `--with-runtime` 自带 CPython 3.14 与全部依赖（含 langchain、Rust 扩展等），安装时不联网；未打包运行时的产物只能退回 fnOS `python312` 在线安装依赖
 - `--with-runtime` 需要在 **Linux/macOS** 构建机上执行（Windows 无法交叉准备 Linux 运行时）；且构建机架构需与目标 NAS 架构一致（amd64/arm64 分开构建，CI 用对应的原生 runner）
-- 依赖默认**只用预编译 wheel**（`--no-build`），并审计 wheel 的 manylinux 基线不高于 glibc 2.36（fnOS / Debian 12 的水平）。若某个包只有更老的基线之外的 wheel，构建会失败而不是打出跑不起来的包
+- 依赖**优先使用预编译 wheel**，缺失时才源码构建 —— `anitopy`、`pinyin2hanzi` 是纯 Python 的 sdist-only 依赖（PyPI 上无 wheel），禁止构建会直接解析失败，因此不能一刀切 `--no-build`。风险由两道审计兜底：wheel 的 manylinux 基线不得高于 glibc 2.36（fnOS / Debian 12），且凡是本地编译出原生 `.so` 的一律终止构建（它链接的是构建机的 glibc 2.39）
 - 产物体积较大（自带解释器 + 全部依赖），预期在数百 MB 量级；这是「安装时零联网」的代价
 - MoviePilot 的插件依赖是在运行时用自身解释器的 pip 安装到 `app/python/` 的 `site-packages`。**升级会整包替换应用目录，插件依赖需要重新安装**
 - 默认使用 **SQLite**；如需 PostgreSQL，可在 `app.env` 中设置 `DB_TYPE=postgresql` 并配置连接（需 fnOS 安装 PostgreSQL）

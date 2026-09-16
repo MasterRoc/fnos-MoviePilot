@@ -25,8 +25,8 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
   python build.py --arch arm64     # 显式指定目标架构（用于裁剪 sites 原生变体）
   python build.py --with-runtime --arch arm64
                                    # 打包自带 Python 3.14 运行时与全部依赖
-  python build.py --with-runtime --allow-build
-                                   # 同上，但允许从源码构建依赖（默认只用预编译 wheel）
+  python build.py --with-runtime --no-build
+                                   # 严格模式：禁止源码构建，只用预编译 wheel
 
 自带 Python 运行时（--with-runtime）：
   MoviePilot V3 的 pyproject.toml 声明 requires-python >=3.14，而 fnOS 应用中心
@@ -36,11 +36,14 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
   是指向构建机绝对路径的符号链接，打进包搬到 NAS 必然失效。整套 app/python/
   是可重定位的，安装时无需在 NAS 上做任何二次安装。
 
-  构建期有三道自检，任何一道不过就终止（宁可构建失败，也不打出能装不能跑的包）：
-    1. 依赖自检   —— 用自带解释器实际 import fastapi/uvicorn/sqlalchemy/pydantic
+  构建期有四道自检，任何一道不过就终止（宁可构建失败，也不打出能装不能跑的包）：
+    1. 依赖自检   —— 用自带解释器实际 import fastapi/uvicorn/sqlalchemy/pydantic/orjson
     2. glibc 审计 —— wheel 标签的 manylinux 基线不得高于 fnOS(Debian 12, glibc 2.36)；
-                     PBS 不自带 _manylinux 策略，pip/uv 会按 runner 的 glibc 2.39 选包
-    3. 路径断言   —— python/bin/python3、bin/python、lib/python3.14/site-packages 必须存在
+                     PBS 不自带 _manylinux 策略，pip/uv 会按 runner 的 glibc 2.39 选包，
+                     所以解析阶段就用 --python-platform 把选择限制在 manylinux_2_36 内
+    3. 源码审计   —— 允许源码构建（anitopy / pinyin2hanzi 等纯 Python 包没有 wheel），
+                     但凡是本地编译出 .so 的，一律终止：它链接的是 runner 的 glibc
+    4. 路径断言   —— python/bin/python3、bin/python、lib/python3.14/site-packages 必须存在
 
   仅 Linux/macOS 可用（无法交叉准备 Linux 运行时）。缺省不打包运行时，安装时
   退回 fnOS python312 在线安装依赖。
@@ -544,13 +547,16 @@ def export_lock_requirements(uv, mp_src):
     return out
 
 
-def install_deps(python_dir, uv, req_file, allow_build=False, python_platform=None):
+def install_deps(python_dir, uv, req_file, no_build=False, python_platform=None):
     """把依赖装进自带解释器的 site-packages（不用 venv，保证目录可整体搬移）。
 
-    默认加 --no-build 强制只用预编译 wheel：CI runner 的 glibc 比 fnOS 新，一旦在
-    runner 上从源码编译，产出的 .so 很可能在 NAS 上跑不起来。宁可构建期报错，
-    也不要打出"能装不能跑"的包。确有纯 Python 的 sdist-only 依赖时可传
-    allow_build=True 放宽。
+    默认**不**加 --no-build。一开始用它强制只用预编译 wheel，结果 CI 直接挂在
+    anitopy 上：该包（以及 pinyin2hanzi）在 PyPI 上根本没有 wheel，只有 sdist，
+    禁止构建会让解析直接失败。官方 Dockerfile 的 uv sync 同样没加 --no-build。
+
+    允许构建带来的风险（在 runner 上现场编译出原生扩展、链接 glibc 2.39）由
+    _audit_source_builds() 事后审计兜底：纯 Python 的本地构建放行，带 .so 的
+    直接终止构建。想恢复"绝不构建"的严格模式可传 no_build=True。
 
     关于 --system：python-build-standalone 的 install_only 前缀没有 pyvenv.cfg，属于
     "系统式"环境，直觉上似乎必须加 --system。实测（uv 0.12.15）并非如此 —— 只要用
@@ -566,7 +572,7 @@ def install_deps(python_dir, uv, req_file, allow_build=False, python_platform=No
         sys.exit(1)
 
     base = [uv, "pip", "install", "--python", str(py)]
-    if not allow_build:
+    if no_build:
         base.append("--no-build")
     if python_platform:
         base += ["--python-platform", python_platform]
@@ -580,7 +586,7 @@ def install_deps(python_dir, uv, req_file, allow_build=False, python_platform=No
     env.pop("CONDA_PREFIX", None)
 
     log("==> 安装 MoviePilot 依赖到自带运行时"
-        f"（{'允许源码构建' if allow_build else '仅用预编译 wheel'}）...")
+        f"（{'仅用预编译 wheel' if no_build else '优先 wheel，缺失时源码构建'}）...")
     err = ""
     for i, cmd in enumerate(attempts):
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -592,8 +598,6 @@ def install_deps(python_dir, uv, req_file, allow_build=False, python_platform=No
             log("    默认方式失败，加 --system 重试")
     log("错误: 依赖安装失败:")
     log(err[-2500:])
-    log("     若上面报的是「no wheels available / 需要从源码构建」，说明该包缺少"
-        " cpython-314 的预编译 wheel；确认它是纯 Python 包后可加 --allow-build 放宽。")
     sys.exit(1)
 
 
@@ -628,12 +632,82 @@ def _audit_wheel_glibc(python_dir, max_glibc=(2, 36)):
             "（fnOS / Debian 12），在 NAS 上会因找不到 GLIBC 符号而无法加载：")
         for name, tag in bad[:40]:
             log(f"    {name}  ->  {tag}")
-        log("     处理办法：为该包指定较老的 manylinux 版本，或改用"
-            " --allow-build 从源码编译（会绑上 runner 的 glibc，通常更糟），"
-            "或在 build.py 中调整 max_glibc。")
+        log("     处理办法：为该包指定 wheel 基线较老的版本（uv 的 --python-platform")
+        log("     已经限制在 manylinux_2_36 以内，走到这里说明锁文件里有绕过该限制的来源），")
+        log(f"     或确认目标系统 glibc 后调整 build.py 的 GLIBC_BASELINE / max_glibc。")
         sys.exit(1)
     log(f"==> wheel glibc 审计通过（{seen} 个包，基线均不高于 "
         f"{max_glibc[0]}.{max_glibc[1]}）")
+
+
+def _installed_native_files(info_dir):
+    """从 dist-info 的 RECORD 里挑出安装进去的原生扩展（.so）。"""
+    rec = Path(info_dir) / "RECORD"
+    if not rec.exists():
+        return []
+    out = []
+    try:
+        for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
+            path = line.split(",")[0].strip()
+            if path.endswith(".so") or ".so." in path:
+                out.append(path)
+    except OSError:
+        pass
+    return out
+
+
+def _audit_source_builds(python_dir):
+    """审计"从源码构建"的包，拦住在 runner 上现场编译出来的原生扩展。
+
+    为什么不能 --no-build 一刀切：MoviePilot 有 anitopy、pinyin2hanzi 这类
+    **纯 Python 的 sdist-only 依赖**（PyPI 上根本没有 wheel），禁止构建会直接
+    让解析失败 —— CI 实测就挂在 anitopy 上。官方 Dockerfile 的 uv sync 也没加
+    --no-build。所以这里改成"允许构建、事后审计"：
+
+      * 纯 Python 的本地构建：无害，只记日志放行
+      * 带 .so 的本地构建：危险。它链接的是构建机的 glibc（ubuntu runner 为 2.39），
+        而 fnOS 基于 Debian 12（glibc 2.36），搬到 NAS 很可能因
+        "version `GLIBC_2.39' not found" 崩溃 → 直接终止构建
+
+    判定"本地构建"的依据：本地构建出的 wheel 标签是 cp314-cp314-linux_<arch>
+    （不含 manylinux），而 PyPI 上的正规发行版一定带 manylinux / musllinux /
+    none-any / macosx / win32 之类的标签。
+    """
+    site = _site_packages_dir(python_dir)
+    if not site:
+        log("警告: 未找到 site-packages，跳过源码构建审计")
+        return
+    released = re.compile(r"manylinux|musllinux|none-any|macosx|win_|win32|win_amd64|android|ios")
+    pure, native = [], []
+    for info in sorted(site.glob("*.dist-info")):
+        wheel = info / "WHEEL"
+        if not wheel.exists():
+            continue
+        try:
+            text = wheel.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        tags = re.findall(r"^Tag:\s*(\S+)$", text, re.MULTILINE)
+        if not tags or not any("linux_" in t for t in tags):
+            continue
+        if any(released.search(t) for t in tags):
+            continue
+        name = info.name.split("-")[0]
+        sos = _installed_native_files(info)
+        (native if sos else pure).append((name, tags[0], len(sos)))
+
+    if pure:
+        log(f"==> 本地源码构建（纯 Python，无害）：{', '.join(n for n, _, _ in pure)}")
+    if native:
+        log("错误: 以下依赖在构建机上从源码编译出了原生扩展（.so）：")
+        for name, tag, n in native:
+            log(f"    {name}  ->  {tag}（{n} 个 .so）")
+        log("     它们链接的是构建机的 glibc（ubuntu runner 为 2.39），而 fnOS 基于")
+        log("     Debian 12（glibc 2.36），搬到 NAS 很可能因 GLIBC_2.39 符号缺失而崩溃。")
+        log("     处理办法：为该依赖指定含 cp314 manylinux wheel 的版本，或换成纯 Python 实现。")
+        sys.exit(1)
+    if not pure and not native:
+        log("==> 源码构建审计通过（全部使用预编译 wheel）")
 
 
 def _smoke_test(python_dir):
@@ -658,7 +732,7 @@ def _smoke_test(python_dir):
     log(f"==> 依赖自检通过（{(ver.stdout or ver.stderr).strip()}）")
 
 
-def build_runtime(target_arch, force=False, allow_build=False):
+def build_runtime(target_arch, force=False, no_build=False):
     """准备自带 Python 运行时并把 MoviePilot 依赖装进去。"""
     if get_platform() == "windows":
         log("警告: Windows 上无法准备 Linux 运行时，产物将不含依赖（安装时需在线安装）")
@@ -676,7 +750,7 @@ def build_runtime(target_arch, force=False, allow_build=False):
     fetch_python_runtime(target_arch, force)
     req = export_lock_requirements(uv, MP_DIR)
     python_platform = UV_PLATFORM.get(target_arch) if target_arch else None
-    install_deps(PYTHON_DIR, uv, req, allow_build, python_platform)
+    install_deps(PYTHON_DIR, uv, req, no_build, python_platform)
 
     log(f"==> 依赖安装后体积: {_size_mb(PYTHON_DIR):.1f} MB")
     _log_site_packages_top(PYTHON_DIR)
@@ -684,6 +758,7 @@ def build_runtime(target_arch, force=False, allow_build=False):
     # 装完先验环境再裁剪：裁剪会动文件，出问题时应先看到"环境本身不完整"。
     _smoke_test(PYTHON_DIR)
     _audit_wheel_glibc(PYTHON_DIR)
+    _audit_source_builds(PYTHON_DIR)
 
     log("==> 裁剪运行时：CPython 测试套件、各包 tests 目录、strip 符号 ...")
     _trim_runtime(PYTHON_DIR)
@@ -910,9 +985,11 @@ def main():
                         help="把自带 Python 3.14 运行时与全部依赖一起打包进 fpk"
                              "（安装时完全不联网；仅 Linux/macOS 可用）。"
                              "--with-venv 为兼容旧命令保留的别名")
-    parser.add_argument("--allow-build", action="store_true",
-                        help="允许从源码构建依赖（默认禁止，只用预编译 wheel）。"
-                             "仅在确有纯 Python 的 sdist-only 依赖时使用")
+    parser.add_argument("--no-build", dest="no_build", action="store_true",
+                        help="严格模式：禁止从源码构建，只用预编译 wheel。"
+                             "默认关闭 —— MoviePilot 有 anitopy、pinyin2hanzi 等"
+                             "纯 Python 的 sdist-only 依赖，禁止构建会直接解析失败。"
+                             "原生扩展的 glibc 风险由 _audit_source_builds 审计兜底")
     args = parser.parse_args()
 
     target_arch = resolve_target_arch(args.arch)
@@ -945,7 +1022,7 @@ def main():
     # 并且把结论打印在最后一行，便于在 CI 日志里一眼确认。
     runtime_bundled = False
     if args.with_runtime:
-        runtime_bundled = build_runtime(target_arch, args.force, args.allow_build)
+        runtime_bundled = build_runtime(target_arch, args.force, args.no_build)
         if not runtime_bundled:
             log("")
             log("!!! 警告: 本次产物**不含** Python 运行时与依赖 !!!")

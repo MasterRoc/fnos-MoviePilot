@@ -55,7 +55,8 @@ jobs:
         #   1. 下载 astral-sh/python-build-standalone 的可重定位 CPython 3.14.7
         #      （*install_only_stripped*，arm64 约 29 MB / amd64 约 34 MB）
         #   2. 用 uv 从 MoviePilot 的 uv.lock 导出 runtime-standard 组需求，
-        #      再 --no-build 装进该解释器的 site-packages（只用预编译 wheel）
+        #      再装进该解释器的 site-packages（优先预编译 wheel，缺失才源码构建；
+        #      anitopy / pinyin2hanzi 等纯 Python 包只有 sdist，不能 --no-build 一刀切）
         #   3. 把整个解释器目录随包发布 → 真机安装时零联网、零编译
         # 之所以自带解释器而非 venv：venv 的 bin/python 是指向构建机绝对路径的
         # 符号链接、pyvenv.cfg 也含构建机路径，搬到 NAS 必然失效。
