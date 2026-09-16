@@ -84,6 +84,12 @@ mp_env_ensure "${ENV_FILE}" "MP_UPDATE_CHANNEL" "release"
 mp_env_ensure "${ENV_FILE}" "MP_UPDATE_INTERVAL" "21600"
 mp_env_ensure "${ENV_FILE}" "MP_UPDATE_DEPS" "1"
 
+# 补齐安全密钥（见 lib.sh 的 mp_env_ensure_secret）。缺失会让后端回退到每次
+# 启动随机的默认值：站点索引解不开（"No data available"）、登录态每次重启失效。
+# 只补缺失项，已有值绝不覆盖 —— 轮换密钥会使旧签名与已加密数据作废。
+mp_env_ensure_secret "${ENV_FILE}" "SECRET_KEY"
+mp_env_ensure_secret "${ENV_FILE}" "RESOURCE_SECRET_KEY"
+
 # 更新超级管理员密码（如向导要求修改）
 if [ -n "${wizard_superuser_password:-}" ]; then
     if grep -q '^SUPERUSER_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then

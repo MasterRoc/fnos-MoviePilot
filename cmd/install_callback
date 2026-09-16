@@ -59,6 +59,15 @@ fi
 PORT="${wizard_port:-3002}"
 NGINX_PORT="${wizard_nginx_port:-3005}"
 
+# 生成并固化两个密钥。不写进 app.env 的话，MoviePilot 会回退到
+# `secrets.token_urlsafe(32)` 的随机默认值，**每次启动都变**，导致：
+#   - RESOURCE_SECRET_KEY 变化 -> 解不开 Fernet 加密的站点索引
+#     (user.sites.v3.bin)，站点认证页面选站点显示 "No data available"
+#   - SECRET_KEY 变化 -> 已签发的登录令牌全部作废，每次重启都要重新登录
+# 这里生成一次后写入 app.env 持久化；后续升级/改配置只补齐缺失项，绝不覆盖。
+SECRET_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+RESOURCE_SECRET_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+
 cat > "${ENV_FILE}" <<EOF
 # MoviePilot fnOS 环境配置
 CONFIG_DIR=${CONFIG_DIR}
@@ -67,6 +76,9 @@ PORT=${PORT}
 NGINX_PORT=${NGINX_PORT}
 DB_TYPE=sqlite
 API_TOKEN=${API_TOKEN}
+# 安全密钥：必须持久化，随机默认值会导致站点资源解密失败与登录态失效
+SECRET_KEY=${SECRET_KEY}
+RESOURCE_SECRET_KEY=${RESOURCE_SECRET_KEY}
 SUPERUSER=${wizard_superuser:-admin}
 SUPERUSER_PASSWORD=${wizard_superuser_password}
 # GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时

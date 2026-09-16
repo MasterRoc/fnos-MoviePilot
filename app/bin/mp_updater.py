@@ -763,6 +763,24 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def collect_prepared_resources(data: dict) -> list:
+    """从上游清单里挑出校验通过的站点资源文件（残缺/校验失败的一律丢弃）。"""
+    files = []
+    for item in data.get("resource_files") or []:
+        if not isinstance(item, dict):
+            continue
+        p = Path(str(item.get("path") or ""))
+        if not p.is_file():
+            continue
+        try:
+            if item.get("sha256") and sha256_file(p) != str(item["sha256"]):
+                continue
+        except OSError:
+            continue
+        files.append(p)
+    return files
+
+
 def upstream_artifacts(cfg: Config, current: str):
     """取回 MoviePilot 自带更新下载好的包，命中就不重复下载。
 

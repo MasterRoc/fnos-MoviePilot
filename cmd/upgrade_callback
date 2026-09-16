@@ -63,6 +63,15 @@ mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_CHANNEL" "release"
 mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_INTERVAL" "21600"
 mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_DEPS" "1"
 
+# 补齐安全密钥（老版本安装的 app.env 没有这两个键）。
+# 缺失时 MoviePilot 回退到 `secrets.token_urlsafe(32)` 的**每次启动随机**默认值，
+# 造成「站点认证」选站点显示 "No data available"（RESOURCE_SECRET_KEY 解不开
+# Fernet 加密的 user.sites.v3.bin），以及每次重启登录态失效（SECRET_KEY）。
+# mp_env_ensure_secret 只在缺失时生成一次，已有值一律保留 —— 该密钥一旦轮换，
+# 旧签名与已加密数据即作废，绝不能每次启动重写。
+mp_env_ensure_secret "${CONFIG_DIR}/app.env" "SECRET_KEY"
+mp_env_ensure_secret "${CONFIG_DIR}/app.env" "RESOURCE_SECRET_KEY"
+
 # venv 不存在时先创建：从"内嵌运行时"的包升级到"在线安装"的包时，VENV_DIR 会
 # 指向从未创建过的 ${TRIM_PKGVAR}/venv，后续 pip 调用会让所有镜像源都失败并
 # 中断升级。自带运行时（RUNTIME_BUNDLED=1）自带解释器，无需建 venv。

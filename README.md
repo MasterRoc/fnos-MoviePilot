@@ -251,56 +251,20 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 - 后端源码、前端产物、自带 Python 运行时、fnpack 工具、下载缓存等**所有构建产物全部收敛在 `.local-build/`，不纳入 git**，由构建脚本生成；拉取仓库后需先执行构建脚本，项目根目录不残留任何构建产物
 - 首个登录使用安装向导设置的管理员账号
 
-## 故障排查
+## 感谢与上游仓库
 
-### 启动后短暂 502 / 提示"后端服务启动中"
+本应用是在以下优秀开源项目之上进行的 fnOS 原生封装，特此致谢：
 
-通常不是故障。MoviePilot 后端（uvicorn）**先跑完 lifespan 才 bind 监听端口**，
-而建库与迁移、插件安装、调度器启动都在这一步之前，首次启动可能要几十秒到几分钟。
-在这段时间里前端静态页已经能正常打开，但对 `/api` 的转发必然拿不到连接。
+| 上游仓库 | 说明 |
+|----------|------|
+| [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) | 核心后端（FastAPI 媒体库自动化管理，本包使用的 V3 源码） |
+| [jxxghp/MoviePilot-Frontend](https://github.com/jxxghp/MoviePilot-Frontend) | Vue3 前端（官方预编译 `dist.zip`） |
+| [jxxghp/MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources) | 站点资源（sites 模块 / 索引数据，由独立仓库分发） |
+| [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) | 自带可重定位的 CPython 3.14 运行时（随包分发，安装零联网） |
+| [astral-sh/uv](https://github.com/astral-sh/uv) | 依赖锁定与安装（构建期按 `uv.lock` 装配 `site-packages`） |
+| [fnOS 应用中心](https://www.fnnas.com/) | 飞牛 fnOS 原生应用运行环境、统一网关与 Node.js 运行时 |
 
-前端内置了**就绪门**：`/api` 请求会挂起等待后端就绪（默认最多 180 秒，可用
-`MP_BACKEND_WAIT_TIMEOUT` 环境变量调整），后端可连接后原样转发；超时才返回
-`503` + `Retry-After: 10`，由页面自行重试。所以正常表现是"页面先出来、数据稍后到"，
-而不是刷一串 502。
-
-### 后端真的起不来时看哪里
-
-| 日志 | 内容 |
-|------|------|
-| `TRIM_PKGVAR/backend.log` | 后端进程 stdio，含 import 阶段崩溃的回溯（缺依赖、Python 版本不符等只会落在这里） |
-| `TRIM_PKGVAR/moviepilot.log` | 主管进程日志；后端异常退出时会带上退出码与 `backend.log` 末尾 30 行 |
-| `TRIM_PKGVAR/config/logs/moviepilot.log` | MoviePilot 自己的应用日志 |
-
-主管进程还会把"进程已启动"与"端口已可服务"分开记录（`后端已就绪：127.0.0.1:3002 可连接`），
-只有后者出现才代表后端真正开始对外服务。
-
-### `ModuleNotFoundError: No module named 'app.application.site.sites'`
-
-后端还在 import 阶段就崩了，主管进程会反复重启它。这不是依赖没装，而是**站点资源
-（sites 模块）不在位**：它是 Cython 扩展 + 索引数据，由独立的 MoviePilot-Resources
-仓库分发，不在 MoviePilot 主仓库里，打包与更新时回填。
-
-麻烦在于这个目录随上游重构搬过家：
-
-| 上游版本 | 资源目录 | 缺失时的报错 |
-|----------|----------|--------------|
-| 早期 V3 | `app/helper` | `No module named 'app.helper.sites'` |
-| ≥ 3.0.3 | `app/application/site` | `No module named 'app.application.site.sites'` |
-
-于是老包 + 自更新到新版代码的组合会出现"资源还留在旧目录、新代码找不到"。
-处理：
-
-```bash
-/var/apps/moviepilot/target/cmd/main repair
-```
-
-它会按当前源码结构重新对位，从历史目录或 `.mp-backup/` 里把资源文件找回来
-（纯文件复制、无网络、幂等）。每次 `start` 也会自动跑一遍。若日志提示"本机无法修复"，
-说明磁盘上确实没有这些文件了，重新安装应用包即可。
-
-> 构建侧已改为按源码结构自动定位资源目录（`build.py` 的 `resolve_resource_dir`），
-> 更新器在替换源码后会校验资源在位、缺失即回滚，不会再打出/留下这种版本。
+下载加速依赖 [gh-proxy.com](https://gh-proxy.com/) / [ghfast.top](https://ghfast.top/) 等 GitHub 镜像（直连不通时自动回退）。
 
 ## 免责声明
 

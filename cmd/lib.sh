@@ -133,6 +133,41 @@ mp_env_ensure() {
 }
 
 # ---------------------------------------------------------------------------
+# 密钥补齐（生成一次后永久稳定）
+# ---------------------------------------------------------------------------
+# 为什么必须显式补：
+#   MoviePilot 的 SECRET_KEY / RESOURCE_SECRET_KEY 默认值都是
+#   `secrets.token_urlsafe(32)` —— **每次进程启动重新随机生成**。官方 Docker
+#   把它写进挂在 /config 卷上的 app.env 持久化，所以不受影响；而本项目的
+#   app.env 由 install_callback 的 heredoc 一次性生成，模板里没有这两个键，
+#   于是每次重启密钥都在变。造成两个可见故障：
+#     1) RESOURCE_SECRET_KEY 变化 -> 解不开 Fernet 加密的站点索引
+#        user.sites.v3.bin -> get_authsites() 返回空 -> “站点认证”页面
+#        选站点时显示 "No data available"（文件在位、ABI 也对，就是解不开）；
+#     2) SECRET_KEY 变化 -> 已签发的登录令牌全部作废 -> 每次重启都要重新登录。
+# 上游 tests/test_security_utils.py 明确要求 RESOURCE_SECRET_KEY 变化后旧签名
+# 必须作废，所以这里**只在缺失时写入一次**，绝不在每次启动时覆盖。
+#
+# 密钥格式：Fernet 要求 32 字节 urlsafe-base64。`head -c 32 /dev/urandom | base64`
+# 得到 44 字符（含结尾 '='），解码后 32 字节，符合要求。不能用 64 位的 hex
+# （解码后 32 字节但非 base64 字母表，Fernet 会拒绝）。
+#   $1 配置文件   $2 键名
+mp_env_ensure_secret() {
+    local env_file="$1" key="$2"
+    [ -n "${env_file}" ] || return 0
+    [ -n "${key}" ] || return 0
+    [ -f "${env_file}" ] || return 0
+    if grep -q "^${key}=" "${env_file}" 2>/dev/null; then
+        return 0
+    fi
+    local secret
+    secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+    [ -n "${secret}" ] || return 0
+    echo "${key}=${secret}" >> "${env_file}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Python 运行时解析
 # ---------------------------------------------------------------------------
 # 三种运行时，按优先级：
