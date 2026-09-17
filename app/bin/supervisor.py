@@ -18,7 +18,10 @@ MoviePilot fnOS 主管进程
   BACKEND_PORT / FRONTEND_PORT / GATEWAY_SOCK / LOG_FILE
   PYTHON_BIN（系统 python312，用于启动代理）
   SHARE_LOG（可选，额外写日志到共享目录，便于诊断）
+  MP_MALLOC_TUNING / MP_USE_JEMALLOC / MP_JEMALLOC_PATH（内存调优，见 _malloc_env）
+  MP_MEM_LIMIT_MB（后端内存上限；0=按机器总内存 25% 自适应，负数=关闭看门狗）
 """
+import glob
 import os
 import sys
 import time
@@ -447,6 +450,150 @@ def _cleanup_stale_frontend():
         time.sleep(1)
 
 
+# ---------------------------------------------------------------------------
+# 内存调优（不改上游源码，只在拉起子进程时注入环境变量）
+# ---------------------------------------------------------------------------
+# 后端是"单进程多线程"的 Python 服务（实测 28 线程、RSS ≈ 430MB，其中 393MB 是私有
+# 脏页）。smaps 里除主 heap（约 100MB）外，还有一串 8~32MB 的**无名 rw-p 匿名段** ——
+# 典型的 glibc malloc **次分配区(arena)**：默认 MALLOC_ARENA_MAX = 8 × CPU 核数，线程
+# 一多就各自占着一块 64MB 虚拟、按需常驻的 arena（实测 VmSize 被撑到 2.7GB），碎片
+# 既占内存也很难归还。
+#
+# 这里只改**子进程的启动环境**，不碰上游代码：
+#   MP_MALLOC_TUNING=0    关闭内存调优（回到默认行为）
+#   MP_USE_JEMALLOC=1     启用 jemalloc（**默认关闭**，原因见下）
+#   MP_JEMALLOC_PATH=...  手动指定 jemalloc 路径（自动探测不到时用）
+#
+# 关于 jemalloc 的实测结论（4G 内存 NAS，2026-09，避免以后重复踩）：
+#   glibc + MALLOC_ARENA_MAX=2 : RSS 与默认持平，但 **VmSize 2.7GB → 687MB**
+#   jemalloc（LD_PRELOAD）     : VmSize 更小，但 **RSS 反而多约 70MB**（430MB → 504MB）
+#   → 本应用的 430MB 主要是真实对象占用，不是 glibc arena 碎片。所以默认不开
+#     jemalloc，只保留 arena 限制（省虚拟预留、抑制长期碎片增长）；确实想要
+#     （插件极多、长跑后碎片明显）可用 MP_USE_JEMALLOC=1 自行对比。
+#
+# 跨架构：x86_64 与 aarch64 的库都位于 /usr/lib/<triple>/，用 glob 匹配而不是硬编码
+# 架构串 —— ARM 版 fnOS 走的是同一条代码路径，无需任何分支。
+MALLOC_TUNING = {
+    "MALLOC_ARENA_MAX": "2",             # 限制 arena 数量：多线程碎片的主要来源
+    "MALLOC_TRIM_THRESHOLD_": "131072",  # 128KB：free 后更积极把内存还给系统
+    "MALLOC_MMAP_THRESHOLD_": "131072",
+}
+JEMALLOC_GLOBS = (
+    "/usr/lib/*/libjemalloc.so.2",       # Debian/Ubuntu：x86_64 与 aarch64 都在这里
+    "/usr/lib/*/libjemalloc.so",
+    "/lib/*/libjemalloc.so.2",
+    "/usr/local/lib/libjemalloc.so.2",
+)
+
+
+def _cfg(key, default=""):
+    """读内存调优配置：环境变量优先，其次 ${CONFIG_DIR}/app.env。
+
+    为什么也读 app.env：这样**不改代码、不重新打包**就能调整内存策略，而 app.env
+    本来就是 MoviePilot 的配置落点（升级/覆盖安装都会保留）。例如在 app.env 里写
+    `MP_MEM_LIMIT_MB=700` 即可自定义看门狗上限。
+    """
+    value = os.environ.get(key)
+    if value:
+        return value
+    if not CONFIG_DIR:
+        return default
+    try:
+        with open(os.path.join(CONFIG_DIR, "app.env"), encoding="utf-8",
+                  errors="replace") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, val = line.partition("=")
+                if name.strip() == key:
+                    return val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
+def _find_jemalloc():
+    """定位 jemalloc 共享库；找不到返回空串（自动退回 glibc 调优）。"""
+    explicit = _cfg("MP_JEMALLOC_PATH")
+    if explicit:
+        return explicit if os.path.exists(explicit) else ""
+    for pattern in JEMALLOC_GLOBS:
+        for path in sorted(glob.glob(pattern)):
+            return path
+    try:
+        import ctypes.util
+        return ctypes.util.find_library("jemalloc") or ""    # 库名也可用于 LD_PRELOAD
+    except Exception:
+        return ""
+
+
+def _malloc_env():
+    """给子进程注入的内存相关环境变量（可用 MP_MALLOC_TUNING=0 整体关闭）。"""
+    if _cfg("MP_MALLOC_TUNING", "1") == "0":
+        return {}
+    extra = dict(MALLOC_TUNING)
+    if _cfg("MP_USE_JEMALLOC", "0") == "1":
+        lib = _find_jemalloc()
+        if lib:
+            extra["LD_PRELOAD"] = lib
+            # jemalloc 自己管 arena，glibc 这三个开关对它无意义，去掉以免误导排查
+            for key in ("MALLOC_ARENA_MAX", "MALLOC_TRIM_THRESHOLD_",
+                        "MALLOC_MMAP_THRESHOLD_"):
+                extra.pop(key, None)
+            log("内存调优: 使用 jemalloc（%s）" % lib)
+        else:
+            log("内存调优: 指定启用 jemalloc 但未找到库，退回 glibc 参数"
+                "（Debian/Ubuntu 可安装 libjemalloc2）")
+    return extra
+
+
+# ---------------------------------------------------------------------------
+# 内存看门狗
+# ---------------------------------------------------------------------------
+# 上面的调优能压住"碎片"，压不住真正的泄漏/插件堆积：后端 RSS 若持续上涨，最终会被
+# 内核 OOM kill，表现为"应用莫名其妙挂了、日志戛然而止"。这里给后端加一层持续监控：
+# RSS 连续 _MEM_STRIKES_MAX 次（6 × 5s = 30s）超过上限，就重启**后端**把进程内无法
+# 归还的碎片一次性回收；前端与网关代理不动，页面最多短暂 502 后自愈。
+#
+# 上限取值：MP_MEM_LIMIT_MB > 0 用它；= 0（默认）按机器总内存 25% 自适应、下限 512MB；
+# < 0 关闭看门狗。ARM 版 NAS 内存普遍更小（2G/4G 常见），自适应比写死数值稳妥。
+_MEM_STRIKES_MAX = 6
+
+
+def _proc_rss_mb(pid):
+    """读 /proc/<pid>/status 的 VmRSS（MB）；非 Linux 或读不到时返回 0。"""
+    try:
+        with open("/proc/%d/status" % int(pid), encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def _mem_limit_mb():
+    """返回内存上限（MB）；<= 0 表示关闭看门狗。"""
+    raw = (_cfg("MP_MEM_LIMIT_MB") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value != 0:
+            return value
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                if line.startswith("MemTotal:"):
+                    total_mb = int(line.split()[1]) / 1024.0
+                    return int(max(total_mb * 0.25, 512))
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def start_backend():
     """启动后端"""
     _cleanup_stale_backend()
@@ -461,6 +608,7 @@ def start_backend():
         "HOST": "127.0.0.1",
         "PORT": BACKEND_PORT,
     })
+    env.update(_malloc_env())
     try:
         # 绝对路径启动，便于残留进程清理与 stop 兜底用命令行精确定位本应用后端
         proc = subprocess.Popen(
@@ -494,6 +642,9 @@ def start_frontend():
         "MP_BACKEND_PORT": BACKEND_PORT,
         "MP_FRONTEND_PORT": FRONTEND_PORT,
     })
+    # 前端是 node：给 V8 一个明确的堆上限，避免长期运行后堆无界增长
+    # （实测常驻 66MB，256MB 上限足够；外部已设 NODE_OPTIONS 时不覆盖）
+    env.setdefault("NODE_OPTIONS", "--max-old-space-size=256")
     try:
         proc = subprocess.Popen(
             [node, os.path.join(BIN_DIR, "frontend-server.js")],
@@ -551,11 +702,60 @@ class Services:
         self.proxy = None
         self._lock = threading.Lock()
         self._stop = False
+        self._mem_strikes = 0
+
+    def _check_memory(self):
+        """后端 RSS 持续超限则回收（详见文件内"内存看门狗"注释）。
+
+        只在持锁的 ensure_all 里调用：超限时结束后端进程并置 None，紧接着的启动
+        分支会把它重新拉起（start_backend 自带残留清理，不会出现两个后端并发写库）。
+        """
+        limit = _mem_limit_mb()
+        if limit <= 0:
+            self._mem_strikes = 0
+            return
+        if self.backend is None or self.backend.poll() is not None:
+            self._mem_strikes = 0
+            return
+        rss = _proc_rss_mb(self.backend.pid)
+        if rss <= 0:                                  # 非 Linux 或读不到，静默跳过
+            return
+        if rss <= limit:
+            if self._mem_strikes:
+                log("内存看门狗: 后端 RSS 已回落至 %.0fMB（上限 %dMB）"
+                    % (rss, limit))
+            self._mem_strikes = 0
+            return
+        self._mem_strikes += 1
+        log("内存看门狗: 后端 RSS %.0fMB 超过上限 %dMB（%d/%d）"
+            % (rss, limit, self._mem_strikes, _MEM_STRIKES_MAX))
+        if self._mem_strikes < _MEM_STRIKES_MAX:
+            return
+        log("内存看门狗: 持续超限，重启后端以回收内存（前端/网关代理不受影响）")
+        self._mem_strikes = 0
+        proc = self.backend
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except Exception:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        except Exception as e:
+            log("内存看门狗: 停止后端异常（忽略）: %s" % e)
+        # 置 None 交给同一轮的启动分支重新拉起。这里**不**调用 _note_backend_failure()：
+        # 主动回收不是启动失败，不该触发失败退避。
+        self.backend = None
 
     def ensure_all(self):
         with self._lock:
             if self._stop:
                 return
+            # 先做内存体检：超限时它会停掉后端并置 None，下面随即把新后端拉起
+            self._check_memory()
             if self.backend is None or self.backend.poll() is not None:
                 was_ready = _backend_was_ready()
                 if self.backend is not None:

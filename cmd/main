@@ -44,10 +44,20 @@ fi
 SUPERVISOR="${BIN_DIR}/supervisor.py"
 SUPER_PID_FILE="${TRIM_PKGTMP}/${APP_NAME}-super.pid"
 LOG_FILE="${TRIM_PKGVAR}/${APP_NAME}.log"
+# 主管进程（supervisor.py）的 stdout/stderr 落点。同 UPDATE_STDIO_LOG 的道理：
+# supervisor 的 log() 自己会写 LOG_FILE，再把它整个进程的 stdout 追加到同一个
+# 文件，就会让 moviepilot.log 每行重复两遍（实测）。这里只兜未捕获异常的
+# traceback，启动失败时再补进用户可见的错误日志。
+SUPER_STDIO_LOG="${TRIM_PKGTMP}/${APP_NAME}-supervisor-stdio.log"
 GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
 MP_UPDATER="${BIN_DIR}/mp_updater.py"
 MP_RESOURCES="${BIN_DIR}/mp_resources.py"
 UPDATE_LOG="${TRIM_PKGVAR}/update.log"
+# 更新器 stdout/stderr 的落点。**不要**直接写 UPDATE_LOG：mp_updater.py 自己会写
+# 那个文件（MP_UPDATE_LOG），两边都写会让每一行重复两遍（实测）。这里改写到临时
+# 目录，只兜住"更新器没来得及 log 出去"的内容（未捕获异常的 traceback、timeout
+# 提示），失败时再把尾巴补进 UPDATE_LOG。
+UPDATE_STDIO_LOG="${TRIM_PKGTMP}/${APP_NAME}-updater-stdio.log"
 
 # 共享目录（用于写诊断日志，trim-cli 可读取）；未导出时跳过共享日志
 SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
@@ -130,12 +140,21 @@ run_updater() {
     export MP_UPDATE_LOG="$UPDATE_LOG"
     local rc=0
     log "==> 检查上游更新（$*）"
+    : > "$UPDATE_STDIO_LOG"
     if command -v timeout >/dev/null 2>&1; then
         timeout "${MP_UPDATE_TIMEOUT:-600}" "$APP_PYTHON" "$MP_UPDATER" "$@" \
-            >> "$UPDATE_LOG" 2>&1 || rc=$?
+            >> "$UPDATE_STDIO_LOG" 2>&1 || rc=$?
     else
         # 没有 coreutils timeout 时直接跑（更新器自身对各步都有超时）
-        "$APP_PYTHON" "$MP_UPDATER" "$@" >> "$UPDATE_LOG" 2>&1 || rc=$?
+        "$APP_PYTHON" "$MP_UPDATER" "$@" >> "$UPDATE_STDIO_LOG" 2>&1 || rc=$?
+    fi
+    # 更新器自己的日志已经由它写进 UPDATE_LOG（MP_UPDATE_LOG）；这里只把 stdio 里
+    # 它没覆盖到的部分（traceback、timeout 提示）补进去，排障线索不丢也不重复。
+    if [ -s "$UPDATE_STDIO_LOG" ] && [ "$rc" != "0" ] && [ "$rc" != "10" ]; then
+        {
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [cmd/main] 更新器 stdio 末尾（rc=$rc）"
+            tail -n 20 "$UPDATE_STDIO_LOG"
+        } >> "$UPDATE_LOG"
     fi
     case "$rc" in
         0)   log "==> 无需更新" ;;
@@ -192,7 +211,7 @@ start_app() {
         BACKEND_PORT="$BACKEND_PORT" FRONTEND_PORT="$FRONTEND_PORT" \
         GATEWAY_SOCK="$GATEWAY_SOCK" LOG_FILE="$LOG_FILE" \
         SHARE_LOG="$SHARE_LOG" PYTHON_BIN="$PYTHON_BIN" \
-        "$APP_PYTHON" "$SUPERVISOR" >> "$LOG_FILE" 2>&1 &
+        "$APP_PYTHON" "$SUPERVISOR" >> "$SUPER_STDIO_LOG" 2>&1 &
     echo $! > "$SUPER_PID_FILE"
     disown 2>/dev/null || true
     # 确认主管进程存活
@@ -206,6 +225,13 @@ start_app() {
     done
     echo "错误：主管进程启动失败" > "$TRIM_TEMP_LOGFILE"
     tail -20 "$LOG_FILE" >> "$TRIM_TEMP_LOGFILE"
+    # supervisor 自己也写 LOG_FILE，所以它的未捕获异常只会落在 stdio 文件里
+    if [ -s "$SUPER_STDIO_LOG" ]; then
+        {
+            echo "---- 主管进程 stdio 末尾 ----"
+            tail -20 "$SUPER_STDIO_LOG"
+        } >> "$TRIM_TEMP_LOGFILE"
+    fi
     rm -f "$SUPER_PID_FILE"
     return 1
 }

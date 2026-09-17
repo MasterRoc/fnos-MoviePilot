@@ -572,8 +572,67 @@ def _norm_version(v: str) -> str:
     return str(v).strip().lstrip("v=~^>< ").split()[0] if str(v).strip() else ""
 
 
+# ---------------------------------------------------------------------------
+# 平台 marker 求值（依赖清单里必须过滤掉其他平台专属的包）
+# ---------------------------------------------------------------------------
+_MARKER_ATOM_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=)\s*['\"]([^'\"]*)['\"]\s*$")
+
+
+def _marker_env() -> dict:
+    """当前平台在 PEP 508 marker 里的取值。"""
+    sys_platform = {"linux": "linux", "darwin": "darwin",
+                    "win32": "win32", "cygwin": "win32"}.get(sys.platform, sys.platform)
+    machine = platform.machine().lower()
+    platform_machine = {"amd64": "AMD64", "x86_64": "x86_64", "x86-64": "x86_64",
+                        "aarch64": "aarch64", "arm64": "arm64"}.get(machine, machine)
+    return {"sys_platform": sys_platform, "platform_machine": platform_machine}
+
+
+def _marker_atom_ok(atom: str) -> bool:
+    """单个 `var == 'value'` / `var != 'value'` 原子；看不懂的一律放行。"""
+    m = _MARKER_ATOM_RE.match(atom)
+    if not m:
+        return True
+    var, op, value = m.group(1), m.group(2), m.group(3)
+    env = _marker_env()
+    if var not in env:
+        return True          # python_version / implementation_name 等不参与过滤
+    return env[var] == value if op == "==" else env[var] != value
+
+
+def marker_allows(marker: str) -> bool:
+    """判断 PEP 508 marker 在当前平台是否成立（只服务于"别装其他平台的包"）。
+
+    uv export 产出的清单是 **universal** 的：darwin 专属的 pyobjc-*、win32 专属的
+    pywin32 都带着 marker 躺在 requirements.lock.txt 里。早期实现只看包名，把它们
+    当成本机依赖，于是在 NAS（Linux）上 pip 必然装不出 macOS 框架包（连 sdist 都
+    构建不了：Failed to build 'pyobjc-core'），整个自更新因此失败并回滚 ——
+    "重启即升级"就此永久失效。
+
+    求值策略刻意保守：
+      * 空 marker、含 extra 的 → True（extra 在导出时已按 group 定好，不在这里判）
+      * 顶层按 or、段内按 and 拆，原子交给 _marker_atom_ok
+      * 任何解析不出的部分都算 True：宁可多装一个包，也不能因为看不懂 marker 而
+        漏掉本机真正需要的依赖（最坏退回"不过滤"的旧行为，而不是装出起不来的版本）
+    """
+    text = (marker or "").strip()
+    if not text or "extra" in text:
+        return True
+    for or_part in re.split(r"\bor\b", text):
+        atoms = [a.strip().strip("()").strip() for a in re.split(r"\band\b", or_part)]
+        atoms = [a for a in atoms if a]
+        if atoms and all(_marker_atom_ok(a) for a in atoms):
+            return True
+    return False
+
+
+_REQUIREMENT_RE = re.compile(
+    r"^([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*(==|~=|>=)?\s*([^\s;#]+)\s*(?:;(.*))?")
+
+
 def parse_requirements(path: Path) -> dict:
-    """解析 requirements.lock.txt → {名: 版本}。"""
+    """解析 requirements.lock.txt → {名: 版本}（按当前平台过滤 marker，见 marker_allows）。"""
     pins = {}
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -583,8 +642,8 @@ def parse_requirements(path: Path) -> dict:
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
             continue
-        m = re.match(r"^([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*(==|~=|>=)?\s*([^\s;]+)", line)
-        if m:
+        m = _REQUIREMENT_RE.match(line)
+        if m and marker_allows(m.group(5) or ""):
             pins[m.group(1).lower().replace("_", "-")] = m.group(4)
     return pins
 
@@ -629,9 +688,15 @@ def pyproject_direct_deps(path: Path) -> set:
     deps = (data.get("project") or {}).get("dependencies") or []
     names = set()
     for dep in deps:
-        m = re.match(r"^([A-Za-z0-9_.\-]+)", str(dep))
-        if m:
-            names.add(m.group(1).lower().replace("_", "-"))
+        text = str(dep)
+        m = re.match(r"^([A-Za-z0-9_.\-]+)", text)
+        if not m:
+            continue
+        # 平台专属的直接依赖同样要过滤（如 `pywin32==312 ; sys_platform == 'win32'`），
+        # 否则它会被当成"本机也需要"而拉进安装列表。
+        if not marker_allows(text.split(";", 1)[1] if ";" in text else ""):
+            continue
+        names.add(m.group(1).lower().replace("_", "-"))
     return names
 
 
@@ -699,6 +764,19 @@ def _mirror_host(mirror: str) -> str:
     return mirror.split("//", 1)[-1].split("/", 1)[0]
 
 
+# pip 找不到某个**具体版本**时的报错（两种措辞：新版 pip 报 No matching distribution，
+# 旧版/某些镜像报 Could not find a version that satisfies）。
+_PIP_NOT_FOUND_RE = re.compile(
+    r"(?:No matching distribution found for|Could not find a version that satisfies "
+    r"the requirement)\s+([A-Za-z0-9_.\-]+)==([^\s;,)]+)")
+
+
+def _pin_parts(pin: str) -> tuple:
+    """`name==version` → (规范化名, 版本)。"""
+    name, _, ver = pin.partition("==")
+    return name.lower().replace("_", "-"), ver
+
+
 def install_dependencies(cfg: Config, pins: list) -> bool:
     """pip 补装缺失/变更的依赖。
 
@@ -707,30 +785,61 @@ def install_dependencies(cfg: Config, pins: list) -> bool:
     先尝试 --only-binary=:all:：NAS 上通常没有编译器，装纯 wheel 最快也最稳；
     若某个包只有 sdist，再退一轮允许本地构建（此时编出来的是 NAS 自己的
     glibc，不存在跨机不兼容问题）。
+
+    容错（真实故障）：上游 uv.lock 可能**先于 PyPI 发布**引用某个版本（实测
+    moviepilot-rust==0.3.6，各镜像最高只有 0.3.5）。此时那个包永远装不上，
+    旧实现直接判"依赖同步失败"并回滚 —— 一次发布顺序问题就让"重启即升级"
+    永久失效。现在改为：只有当**所有镜像、两种模式全都试过**之后，才把
+    「源上确实没有这个版本」且「本机已装同名包」的包降级为警告并跳过；
+    本机没装的包（= 缺失依赖）仍然整体失败，绝不放过。
     """
     if not pins:
         return True
-    for only_binary in (True, False):
-        for mirror in PIP_MIRRORS:
-            cmd = [cfg.python, "-m", "pip", "install",
-                   "--no-deps", "--no-cache-dir", "--disable-pip-version-check",
-                   "-i", mirror, "--trusted-host", _mirror_host(mirror),
-                   "--timeout", "30", "--retries", "2"]
-            if only_binary:
-                cmd.append("--only-binary=:all:")
-            cmd += pins
-            log(f"==> 同步依赖（{'仅 wheel' if only_binary else '允许源码构建'}，{mirror}）："
-                f"{len(pins)} 个包")
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            except subprocess.TimeoutExpired:
-                log("    依赖安装超时，换下一个镜像")
+    installed = installed_versions()
+    skipped = {}                     # {规范化名: 源上找不到的目标版本}
+    for _round in (0, 1):
+        not_found = set()            # 本轮所有镜像报过"没有该版本"的 (名, 版本)
+        for only_binary in (True, False):
+            for mirror in PIP_MIRRORS:
+                pending = [p for p in pins if _pin_parts(p)[0] not in skipped]
+                if not pending:
+                    log("==> 依赖同步完成")
+                    return True
+                cmd = [cfg.python, "-m", "pip", "install",
+                       "--no-deps", "--no-cache-dir", "--disable-pip-version-check",
+                       "-i", mirror, "--trusted-host", _mirror_host(mirror),
+                       "--timeout", "30", "--retries", "2"]
+                if only_binary:
+                    cmd.append("--only-binary=:all:")
+                cmd += pending
+                log(f"==> 同步依赖（{'仅 wheel' if only_binary else '允许源码构建'}，"
+                    f"{mirror}）：{len(pending)} 个包")
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                except subprocess.TimeoutExpired:
+                    log("    依赖安装超时，换下一个镜像")
+                    continue
+                if r.returncode == 0:
+                    log("==> 依赖同步完成")
+                    return True
+                err = (r.stderr or "") + (r.stdout or "")
+                tail = err.strip().splitlines()[-3:]
+                log("    失败：" + " | ".join(tail))
+                not_found.update(_PIP_NOT_FOUND_RE.findall(err))
+        # 整轮（全部镜像 × 两种模式）都失败：只对"源上没这个版本 + 本机已装"降级跳过，
+        # 并在日志里留痕，便于运行异常时定位到"某个包其实没升上去"。
+        added = False
+        for name, ver in sorted(not_found):
+            key = name.lower().replace("_", "-")
+            have = installed.get(key)
+            if key in skipped or not have:
                 continue
-            if r.returncode == 0:
-                log("==> 依赖同步完成")
-                return True
-            tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
-            log("    失败：" + " | ".join(tail))
+            skipped[key] = ver
+            log(f"    警告：{key}=={ver} 在所有镜像上都不可得（上游锁文件早于 PyPI 发布？），"
+                f"保留已装版本 {have} 继续更新；若运行异常可用 cmd/main rollback 回退")
+            added = True
+        if not added:
+            return False
     return False
 
 

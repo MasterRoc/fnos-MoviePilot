@@ -210,15 +210,23 @@ SHARE_DIR="${SHARE_PATHS%%:*}"
 [ -n "${SHARE_DIR}" ] || SHARE_DIR="${TRIM_PKGVAR}"
 ERR_OUT="${SHARE_DIR}/moviepilot-init-error.log"
 : > "${ERR_OUT}"
+# 注意：INIT_SCRIPT 自己会写 install.log（LOG_FILE），这里**不能**再 tee 到同一个
+# 文件，否则每行重复两遍（实测）。tee 只负责共享目录那份错误日志。
 CONFIG_DIR="${CONFIG_DIR}" MP_SRC="${MP_SRC}" LOG_FILE="${TRIM_PKGVAR}/install.log" \
-    "${PYTHON}" "${INIT_SCRIPT}" 2>&1 | tee -a "${TRIM_PKGVAR}/install.log" "${ERR_OUT}"
+    "${PYTHON}" "${INIT_SCRIPT}" 2>&1 | tee -a "${ERR_OUT}"
 INIT_RC=${PIPESTATUS[0]}
 if [ "${INIT_RC}" -ne 0 ]; then
     # 失败：把详细日志写入 TRIM_TEMP_LOGFILE（注意 fail 会覆盖，这里手动写入完整错误后 exit）
     {
         echo "超级管理员初始化失败，最近日志："
         echo "--------------------------------------------------"
-        tail -n 60 "${TRIM_PKGVAR}/install.log" 2>/dev/null
+        if [ -s "${TRIM_PKGVAR}/install.log" ]; then
+            tail -n 60 "${TRIM_PKGVAR}/install.log" 2>/dev/null
+        else
+            # 脚本可能在写出第一行日志前就崩了（例如 import MoviePilot 失败），
+            # 这时用它自己的 stdio 兜底，别让用户看到一片空白
+            tail -n 60 "${ERR_OUT}" 2>/dev/null
+        fi
         echo "--------------------------------------------------"
         echo "详细错误已保存到共享目录：${ERR_OUT}"
     } > "$TRIM_TEMP_LOGFILE"

@@ -85,8 +85,12 @@ if [ -n "${wizard_superuser_password:-}" ]; then
     # 同步到 MoviePilot 用户库（复用同一个初始化脚本，幂等）
     INIT_SCRIPT="${BIN_DIR}/mp_init_superuser.py"
     if [ -x "${APP_PYTHON}" ] && [ -f "${INIT_SCRIPT}" ]; then
+        # 脚本自己会写 config.log（LOG_FILE），这里不能再重定向到同一文件（每行会
+        # 重复两遍）。stdio 落到 PKGVAR 下的独立文件（该目录必定存在，避免重定向
+        # 失败导致脚本根本没跑），未捕获异常的 traceback 仍可查。
         CONFIG_DIR="${CONFIG_DIR}" MP_SRC="${MP_SRC}" LOG_FILE="${TRIM_PKGVAR}/config.log" \
-            "${APP_PYTHON}" "${INIT_SCRIPT}" >> "${TRIM_PKGVAR}/config.log" 2>&1
+            "${APP_PYTHON}" "${INIT_SCRIPT}" \
+            >> "${TRIM_PKGVAR}/config-init-stdio.log" 2>&1
     fi
 fi
 

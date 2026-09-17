@@ -16,6 +16,8 @@
   E/F 真实网络（可选，不可达时 SKIP）
   G 命令行参数契约
   H 版本发现降级链（API / 网页 latest / atom / 分支 version.py）与镜像配置（离线打桩）
+  I 依赖清单的平台 marker 过滤（pyobjc-* 等其他平台专属包不得进安装计划）
+  J 源上不可得的版本：本机已装则跳过继续，本机未装则仍然失败
 """
 import hashlib
 import json
@@ -35,6 +37,11 @@ REAL_SRC = ROOT / ".local-build" / "_src" / "v303" / "MoviePilot-3.0.3"
 os.environ.setdefault("MP_UPDATE_LOG", str(SANDBOX / "update.log"))
 sys.path.insert(0, str(ROOT / "app" / "bin"))
 import mp_updater as mod  # noqa: E402
+
+# 场景 A 会把 mod.install_dependencies 打桩成 no-op（Windows 上不能真装 179 个包）
+# 且**故意不复原**（B 之后的场景都依赖这个桩）。想测真函数必须提前留一份引用，
+# 否则测的就是那个 lambda —— 表现为"用例永远通过/永远失败"。
+REAL_INSTALL_DEPS = mod.install_dependencies
 
 FAILS = []
 
@@ -224,10 +231,16 @@ def scenario_d():
     lock_only.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REAL_SRC / "uv.lock", lock_only / "uv.lock")
     cfg = mod.Config()
+    # 打桩"已装清单"：候选范围 = 随包清单 ∪ 已装环境 ∪ 直接依赖，而开发机上往往
+    # 恰好装着 requests/urllib3 之类同名不同版本的包，会让"候选范围为空"这个前提
+    # 不成立（用例在开发机假失败、在干净环境才通过）。显式清空才测的是意图。
+    real_installed = mod.installed_versions
+    mod.installed_versions = lambda: {}
     to_install, missing = mod.plan_dependencies(cfg, lock_only, {})
     check("D9 无候选范围时不装包", to_install == [], f"{len(to_install)} 个")
     # 候选范围含 fastapi 时应产生计划（fastapi 必然已装或缺失）
     to_install2, missing2 = mod.plan_dependencies(cfg, lock_only, {"fastapi": "0.100.0"})
+    mod.installed_versions = real_installed
     check("D10 候选范围内会产出计划", any(p.startswith("fastapi==") for p in to_install2),
           str(to_install2[:3]))
 
@@ -442,6 +455,104 @@ def scenario_h():
     os.environ.pop("MP_UPDATE_INTERVAL", None)
 
 
+def scenario_i():
+    """I 依赖清单的平台 marker 过滤（离线）。
+
+    真实故障：requirements.lock.txt 由 `uv export` 生成，是 **universal** 清单 ——
+    darwin 专属的 pyobjc-* 带着 marker 躺在里面。旧实现只看包名，于是在 Linux 的
+    NAS 上试图 pip install pyobjc-core，必然失败（No matching distribution /
+    Failed to build），整个自更新因此回滚，"重启即升级"永久失效。
+    """
+    print("\n=== 场景 I：依赖清单的平台 marker 过滤 ===")
+    mp, fe, cfgdir = build_sandbox()
+    cfg = mod.Config()
+
+    check("I1 空 marker 放行", mod.marker_allows(""))
+    check("I2 未知变量保守放行（不误删本机依赖）",
+          mod.marker_allows("python_version >= '3.14'"))
+    check("I3 extra 条件放行（由导出 group 决定）", mod.marker_allows("extra == 'runtime'"))
+
+    darwin_only = ("(platform_machine == 'arm64' and sys_platform == 'darwin') or "
+                   "(platform_machine == 'x86_64' and sys_platform == 'darwin')")
+    env = mod._marker_env()
+    check("I4 darwin 专属 marker 按平台判定",
+          mod.marker_allows(darwin_only) == (env["sys_platform"] == "darwin"), str(env))
+
+    # 真实清单节选（与 uv export 的输出同形）
+    (mp / "requirements.lock.txt").write_text(
+        "# 节选（uv export 的 universal 输出）\n"
+        "moviepilot-rust==0.3.5 ; (platform_machine == 'arm64' and sys_platform == 'darwin')"
+        " or (platform_machine == 'x86_64' and sys_platform == 'darwin')"
+        " or (platform_machine == 'aarch64' and sys_platform == 'linux')"
+        " or (platform_machine == 'x86_64' and sys_platform == 'linux')"
+        " or (platform_machine == 'AMD64' and sys_platform == 'win32')\n"
+        f"pyobjc-core==12.2.2 ; {darwin_only}\n"
+        "pywin32==312 ; platform_machine == 'AMD64' and sys_platform == 'win32'\n"
+        "orjson==3.12.0\n",
+        encoding="utf-8")
+    base = mod.packaged_pins(cfg)
+    check("I5 base 里没有 pyobjc-core", "pyobjc-core" not in base, str(sorted(base)))
+    check("I6 pywin32 只在 win32 平台保留",
+          ("pywin32" in base) == (env["sys_platform"] == "win32"), str(sorted(base)))
+    check("I7 无条件依赖照常解析出版本号", base.get("orjson") == "3.12.0", str(base))
+
+    # 端到端：真实 uv.lock 下的依赖计划里不得出现任何 pyobjc-*
+    real_installed = mod.installed_versions
+    mod.installed_versions = lambda: {"moviepilot-rust": "0.0.1", "orjson": "0.0.1",
+                                      "pystray": "0.19.5"}
+    new_root = SANDBOX / "newsrc" / "MoviePilot-3.0.4"
+    pins, missing = mod.plan_dependencies(cfg, new_root, base)
+    mod.installed_versions = real_installed
+    if pins:
+        check("I8 依赖计划里不含 pyobjc-*",
+              not any("pyobjc" in p for p in pins), str(pins))
+        if "moviepilot-rust" in base:
+            check("I9 平台相关的包仍会被计划升级",
+                  any(p.startswith("moviepilot-rust") for p in pins), str(pins))
+        else:
+            print("SKIP I9 当前平台不匹配 moviepilot-rust 的 marker")
+    else:
+        print("SKIP I8/I9 缺少本地 uv.lock 样本（.local-build/_src）")
+
+
+def scenario_j():
+    """J 依赖容错：源上没有该版本时不整体失败（离线打桩）。
+
+    真实故障：上游 uv.lock 引用 moviepilot-rust==0.3.6，而各镜像最高只有 0.3.5。
+    旧实现直接判"依赖同步失败"并回滚 —— 一次发布顺序问题就让"重启即升级"永久失效。
+    现在的口径：所有镜像都试过仍缺该版本 + **本机已装**同名包 → 警告跳过；
+    本机没装的包（缺失依赖）→ 仍然失败，绝不放过。
+    """
+    print("\n=== 场景 J：源上不可得的版本如何处理（离线打桩）===")
+    mp, fe, cfgdir = build_sandbox()
+    cfg = mod.Config()
+
+    class _FailResult:
+        returncode = 1
+        stdout = ""
+        stderr = ("ERROR: Could not find a version that satisfies the requirement "
+                  "moviepilot-rust==0.3.6 (from versions: 0.3.5)\n"
+                  "ERROR: No matching distribution found for moviepilot-rust==0.3.6\n")
+
+    real_run = mod.subprocess.run
+    real_mirrors = mod.PIP_MIRRORS
+    real_installed = mod.installed_versions
+    mod.subprocess.run = lambda *a, **k: _FailResult()
+    mod.PIP_MIRRORS = ("https://mirror-a/", "https://mirror-b/")
+
+    mod.installed_versions = lambda: {"moviepilot-rust": "0.3.5"}
+    check("J1 本机已装的包在源上不可得 → 跳过并继续",
+          REAL_INSTALL_DEPS(cfg, ["moviepilot-rust==0.3.6"]) is True)
+
+    mod.installed_versions = lambda: {}
+    check("J2 本机未装的包不可得 → 仍然失败（缺失依赖不放过）",
+          REAL_INSTALL_DEPS(cfg, ["moviepilot-rust==0.3.6"]) is False)
+
+    mod.subprocess.run = real_run
+    mod.PIP_MIRRORS = real_mirrors
+    mod.installed_versions = real_installed
+
+
 if __name__ == "__main__":
     mod._real_smoke_test = mod.smoke_test
     scenario_a()
@@ -453,5 +564,7 @@ if __name__ == "__main__":
     scenario_f()
     scenario_g()
     scenario_h()
+    scenario_i()
+    scenario_j()
     print("\n" + ("全部通过" if not FAILS else f"失败 {len(FAILS)} 项: {FAILS}"))
     sys.exit(1 if FAILS else 0)

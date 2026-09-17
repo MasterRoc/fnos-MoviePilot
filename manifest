@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 1.0.6
+version               = 1.0.7
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。<br><br>🐛 <b>问题反馈：</b><a href="https://github.com/jxxghp/MoviePilot/issues" target="_blank">GitHub Issues</a>
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v1.0.6<br>1.修复“登录之后所有页面都读不到数据”这个根因缺陷：fnOS 统一网关会把请求里的 Authorization 头当成它自己的令牌校验，MoviePilot 的 JWT 校验不过，网关直接返回 200 text/plain “invalid token”，请求根本到不了应用。此前表现为仪表盘 CPU/内存/系统信息全空、关于页的认证资源版本与站点资源版本为空、推荐与订阅报“服务器返回了无效响应”、站点认证 No data available。现由网关代理注入的 polyfill 把该头改名为 X-MP-Auth（自定义头网关不校验），转发到前端服务前再还原成 Authorization 交给后端<br>2.说明：因该缺陷，此前 v1.0.3/v1.0.4 关于密钥与站点资源的判断并非故障根因（密钥仍需持久化，但并非“No data available”的原因）；如果你也遇到过“改了配置点保存没反应”“站点统计一直是 0”，同样由本条修复<br>3.新增回归：polyfill_smoke 增加 XHR/fetch 认证头改名与代理回译的用例，防止被改回去
+changelog             = v1.0.7<br>1.修复<b>自动更新永久失效</b>：依赖清单里的平台专属包（pyobjc-*、pywin32 等）此前被当作 Linux 依赖去安装，必然失败并整体回滚；现在按 PEP 508 marker 过滤，并且“上游锁文件引用了尚未发布到镜像的版本”时只跳过该包继续更新（本机未装的仍会报错）<br>2.修复应用内自更新后配置目录属主未收敛导致的 SQLite “attempt to write a readonly database”：升级成功后与安装/升级回调同一口径递归修正属主，避免写配置/写库时报只读<br>3.修复日志每行重复两遍（更新器、安装、配置三处的重复重定向）<br>4.内存优化：限制 malloc arena（实测 VmSize 2.7GB→0.77GB、RSS 约降 10~20%），并新增内存看门狗——后端持续超阈值时自动回收；阈值与开关可在 app.env 调整，x86_64 与 ARM 通用<br>5.构建脚本依赖安装改走国内镜像，不再直连 pypi.org

@@ -47,6 +47,29 @@ fnOS 统一网关会把请求里的 `Authorization` 当成**它自己的**令牌
 转发到前端服务时再还原成 `Authorization` 交给后端。回归断言见 `tools/polyfill_smoke.py` 的 H 组与
 端到端用例。
 
+#### 怎么判断是不是撞上了它
+
+在 NAS 上用**同一个接口**做三组对照（`/app/moviepilot/api/v1/dashboard/memory`）：
+
+| 请求 | 经网关的结果 | 结论 |
+|------|--------------|------|
+| 不带认证头 | `401 application/json` | 正常穿过网关 |
+| 自定义头 `X-MP-Auth: <JWT>` | `401 application/json` | 正常穿过网关 |
+| `Authorization: <JWT>` | `200 text/plain "invalid token"`（13 字节） | 被网关拦下，请求根本没到应用 |
+
+```bash
+curl -i -H "Authorization: Bearer $TOKEN" 'http://<NAS>/app/moviepilot/api/v1/dashboard/memory'
+curl -i -H "X-MP-Auth: Bearer $TOKEN"      'http://<NAS>/app/moviepilot/api/v1/dashboard/memory'
+```
+
+排查要点：
+
+- 「登录能成功、登录后所有页面都读不到数据」「前端统一报『服务器返回了无效响应』」时，先看响应体
+  是不是 `text/plain` 的 `invalid token` —— **状态码 200 不代表请求到了应用**，前端因为拿到非 JSON
+  才报那句通用错误
+- 这也能解释为什么 v1.0.3 / v1.0.4 里围绕密钥与站点资源的判断都不是根因：那些请求压根没到后端，
+  自然永远是空数据（密钥仍需持久化，但它不是「No data available」的原因）
+
 ### 为什么要自带 Python 3.14
 
 MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS 应用中心提供的运行时是 `python312` —— 版本不够。官方 Docker 镜像的处理方式同样是自带解释器（`/opt/python`）。本应用沿用同一思路：
@@ -86,9 +109,9 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 ├── wizard/                      # 安装/配置/卸载向导
 ├── manifest
 ├── build.py                    # 跨平台构建脚本（推荐）
-├── build.ps1 / build.sh        # 构建脚本（备选）
 ├── tools/
-│   └── updater_smoke.py        # 自更新器离线冒烟测试（沙箱，Windows 亦可跑）
+│   ├── updater_smoke.py        # 自更新器离线冒烟测试（沙箱，Windows 亦可跑）
+│   └── polyfill_smoke.py       # 代理注入的 JS polyfill 冒烟测试（需 node，缺失则 SKIP）
 ├── ICON.PNG / ICON_256.PNG
 └── README.md
 ```
@@ -114,18 +137,6 @@ python build.py --with-runtime --no-build
 
 > `--with-venv` 仍可用，是 `--with-runtime` 的兼容别名（早期版本打包的是 venv，现已改为自带解释器）。
 
-备选脚本：
-
-```bash
-# Windows
-./build.ps1                # 默认 amd64
-./build.ps1 -Arch arm64
-
-# Linux / macOS
-./build.sh                 # 默认 amd64
-ARCH=arm64 ./build.sh
-```
-
 构建脚本会自动：
 1. 从 GitHub 下载 MoviePilot V3 源码到 `.local-build/mp`（打包内置）
 2. 从 GitHub Releases 下载前端 `dist.zip` 到 `.local-build/frontend`（打包内置）
@@ -145,7 +156,6 @@ ARCH=arm64 ./build.sh
   - 手动触发：Actions 页点 `workflow_dispatch`（只构建，不发 Release）
   - 打标签发布：`git tag v1.1.3104 && git push origin v1.1.3104`（自动生成 Release 并附带 changelog）
 - 推分支**不会**触发这个 workflow —— 单架构十几分钟、产物 250 MB，每次提交都跑不划算。
-  推 `master` 或提 PR 时只跑 `lint.yml`（Python/Shell/Node 语法 + manifest 版本一致性，秒级返回）。
 
 > 打 tag 前先确认 `manifest` 的 `version` 已同步改动：CI 会校验 tag 与 manifest 版本一致，
 > 不一致直接失败（避免发出"标题 v1.0.2、附件却是 moviepilot-1.0.1.fpk"的 Release）。
